@@ -1,0 +1,32 @@
+bundle:
+  name: renfe-train-analytics
+
+sync:
+  exclude:
+    - .git/
+    - .venv/
+    - __pycache__/
+    - "*.pyc"
+    - ".DS_Store"
+    - "data/*.zip"
+    - "data/fomento_transit/"
+    - "data/google_transit/"
+
+resources:
+  apps:
+    renfe_train_analytics_app:
+      name: renfe-train-analytics-${bundle.target}
+      description: Renfe analytics Streamlit app deployed with Databricks Asset Bundles.
+      source_code_path: .
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}-app
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}-app
