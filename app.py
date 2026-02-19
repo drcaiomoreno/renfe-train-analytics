@@ -68,6 +68,38 @@ FROM catalog_caiom7nmz_d9oink.renfe_app_data.atendo_accessibility
 
 DEFAULT_GENIE_SPACE_ID = "01f10d0ef5311278a6829ada8a43e5b7"
 DEFAULT_GENIE_SPACE_ID_2 = "01f10d2386d41be4a33a652f9e3cf521"
+DEFAULT_UC_CATALOG = "catalog_caiom7nmz_d9oink"
+DEFAULT_UC_SCHEMA = "renfe_app_data"
+
+
+def _apply_app_style() -> None:
+    st.markdown(
+        """
+        <style>
+        .main .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+        .dbx-header {
+            background: linear-gradient(90deg, #0f172a 0%, #1e293b 100%);
+            border: 1px solid #334155;
+            border-radius: 14px;
+            padding: 18px 22px;
+            margin-bottom: 14px;
+        }
+        .dbx-title {color: #f8fafc; font-size: 1.6rem; font-weight: 700; margin: 0;}
+        .dbx-subtitle {color: #cbd5e1; margin-top: 4px; margin-bottom: 0;}
+        .dbx-user {
+            display: inline-block;
+            border: 1px solid #334155;
+            border-radius: 999px;
+            padding: 6px 12px;
+            color: #e2e8f0;
+            background: #111827;
+            font-size: 0.9rem;
+            white-space: nowrap;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -133,6 +165,27 @@ def _default_genie_space_id() -> str:
 
 def _default_genie_space_id_2() -> str:
     return (os.getenv("GENIE_SPACE_ID_2", "") or DEFAULT_GENIE_SPACE_ID_2).strip()
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _current_user_name() -> str:
+    for env_key in ("DATABRICKS_USER", "DATABRICKS_USERNAME", "USER"):
+        value = (os.getenv(env_key, "") or "").strip()
+        if value:
+            return value
+    try:
+        from databricks.sdk import WorkspaceClient
+
+        me = WorkspaceClient().current_user.me()
+        display_name = (getattr(me, "display_name", "") or "").strip()
+        user_name = (getattr(me, "user_name", "") or "").strip()
+        if display_name:
+            return display_name
+        if user_name:
+            return user_name
+    except Exception:
+        pass
+    return "Unknown User"
 
 
 def _read_csv_flexible(path: Path, sep: str = ";") -> pd.DataFrame:
@@ -367,14 +420,14 @@ def normalize_geo_points(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["station_code", "station_name", "lat", "lon", "province", "source"])
 
-    lat_col = _pick_col(df, ["lat", "latitude", "stop_lat"])
-    lon_col = _pick_col(df, ["lon", "lng", "longitude", "stop_lon"])
+    lat_col = _pick_col(df, ["lat", "latitude", "stop_lat", "latitud"])
+    lon_col = _pick_col(df, ["lon", "lng", "longitude", "stop_lon", "longitud"])
     if not lat_col or not lon_col:
         return pd.DataFrame(columns=["station_code", "station_name", "lat", "lon", "province", "source"])
 
-    code_col = _pick_col(df, ["station_code", "stop_id", "id", "code"])
-    name_col = _pick_col(df, ["station_name", "stop_name", "name", "point_name"])
-    province_col = _pick_col(df, ["province", "region", "state"])
+    code_col = _pick_col(df, ["station_code", "stop_id", "id", "code", "codigo", "codigo_de_estacion"])
+    name_col = _pick_col(df, ["station_name", "stop_name", "name", "point_name", "descripcion", "nombre_de_la_estacion"])
+    province_col = _pick_col(df, ["province", "region", "state", "provincia"])
     source_col = _pick_col(df, ["source", "feed", "dataset"])
 
     out = pd.DataFrame(
@@ -507,24 +560,155 @@ def load_data_from_warehouse(
     incidents_sql = _clean_query(query_map.get("incidents", ""))
     atendo_sql = _clean_query(query_map.get("atendo", ""))
 
+    def _is_table_not_found_error(exc: Exception) -> bool:
+        return "TABLE_OR_VIEW_NOT_FOUND" in str(exc)
+
     if stations_sql:
-        data["stations"] = normalize_geo_points(run_warehouse_query(server_hostname, http_path, access_token, stations_sql))
+        try:
+            data["stations"] = normalize_geo_points(run_warehouse_query(server_hostname, http_path, access_token, stations_sql))
+        except Exception as exc:
+            msg = str(exc).lower()
+            if _is_table_not_found_error(exc) and "stations_dim" in msg:
+                fallback_sql = f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_csv_estaciones"
+                data["stations"] = normalize_geo_points(
+                    run_warehouse_query(server_hostname, http_path, access_token, fallback_sql)
+                )
+            else:
+                raise
     if trips_sql:
-        data["trip_updates"] = normalize_trip_updates(run_warehouse_query(server_hostname, http_path, access_token, trips_sql))
+        try:
+            data["trip_updates"] = normalize_trip_updates(run_warehouse_query(server_hostname, http_path, access_token, trips_sql))
+        except Exception as exc:
+            if _is_table_not_found_error(exc) and "trip_updates_rt" in str(exc).lower():
+                fallback_sql = _clean_query(
+                    f"""
+                    SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_json_trip_updates
+                    UNION ALL
+                    SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_json_trip_updates_ld
+                    """
+                )
+                try:
+                    data["trip_updates"] = normalize_trip_updates(
+                        run_warehouse_query(server_hostname, http_path, access_token, fallback_sql)
+                    )
+                except Exception:
+                    data["trip_updates"] = pd.DataFrame(
+                        columns=["feed", "entity_id", "trip_id", "delay_seconds", "timestamp"]
+                    )
+            else:
+                raise
     if vehicles_sql:
-        data["vehicles"] = normalize_vehicles(run_warehouse_query(server_hostname, http_path, access_token, vehicles_sql))
+        try:
+            data["vehicles"] = normalize_vehicles(
+                run_warehouse_query(server_hostname, http_path, access_token, vehicles_sql)
+            )
+        except Exception as exc:
+            if _is_table_not_found_error(exc) and "vehicle_positions_rt" in str(exc).lower():
+                fallback_sql = f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_json_vehicle_positions"
+                try:
+                    data["vehicles"] = normalize_vehicles(
+                        run_warehouse_query(server_hostname, http_path, access_token, fallback_sql)
+                    )
+                except Exception:
+                    data["vehicles"] = pd.DataFrame(
+                        columns=["entity_id", "trip_id", "vehicle_id", "vehicle_label", "status", "stop_id", "lat", "lon"]
+                    )
+            else:
+                raise
     if routes_sql:
-        data["gtfs_routes"] = normalize_routes(run_warehouse_query(server_hostname, http_path, access_token, routes_sql))
+        try:
+            data["gtfs_routes"] = normalize_routes(
+                run_warehouse_query(server_hostname, http_path, access_token, routes_sql)
+            )
+        except Exception as exc:
+            if _is_table_not_found_error(exc) and "routes_dim" in str(exc).lower():
+                fallback_candidates = [
+                    f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_google_transit_routes",
+                    f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_fomento_transit_routes",
+                    f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_horarios_feve_routes",
+                ]
+                loaded = False
+                for fallback_sql in fallback_candidates:
+                    try:
+                        data["gtfs_routes"] = normalize_routes(
+                            run_warehouse_query(server_hostname, http_path, access_token, fallback_sql)
+                        )
+                        loaded = True
+                        break
+                    except Exception:
+                        continue
+                if not loaded:
+                    data["gtfs_routes"] = pd.DataFrame(columns=["route_id", "route_short_name", "route_type"])
+            else:
+                raise
     if scheduled_trips_sql:
-        data["gtfs_trips"] = normalize_scheduled_trips(
-            run_warehouse_query(server_hostname, http_path, access_token, scheduled_trips_sql)
-        )
+        try:
+            data["gtfs_trips"] = normalize_scheduled_trips(
+                run_warehouse_query(server_hostname, http_path, access_token, scheduled_trips_sql)
+            )
+        except Exception as exc:
+            if _is_table_not_found_error(exc) and "trips_dim" in str(exc).lower():
+                fallback_candidates = [
+                    f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_google_transit_trips",
+                    f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_fomento_transit_trips",
+                    f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_horarios_feve_trips",
+                ]
+                loaded = False
+                for fallback_sql in fallback_candidates:
+                    try:
+                        data["gtfs_trips"] = normalize_scheduled_trips(
+                            run_warehouse_query(server_hostname, http_path, access_token, fallback_sql)
+                        )
+                        loaded = True
+                        break
+                    except Exception:
+                        continue
+                if not loaded:
+                    data["gtfs_trips"] = pd.DataFrame(columns=["trip_id", "route_id", "direction_id"])
+            else:
+                raise
     if alerts_sql:
-        data["alerts"] = normalize_alerts(run_warehouse_query(server_hostname, http_path, access_token, alerts_sql))
+        try:
+            data["alerts"] = normalize_alerts(
+                run_warehouse_query(server_hostname, http_path, access_token, alerts_sql)
+            )
+        except Exception as exc:
+            if _is_table_not_found_error(exc) and "alerts_rt" in str(exc).lower():
+                fallback_sql = f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_json_alerts"
+                try:
+                    data["alerts"] = normalize_alerts(
+                        run_warehouse_query(server_hostname, http_path, access_token, fallback_sql)
+                    )
+                except Exception:
+                    data["alerts"] = pd.DataFrame(columns=["id", "route_count", "description"])
+            else:
+                raise
     if incidents_sql:
-        data["incidents"] = run_warehouse_query(server_hostname, http_path, access_token, incidents_sql)
+        try:
+            data["incidents"] = run_warehouse_query(server_hostname, http_path, access_token, incidents_sql)
+        except Exception as exc:
+            if _is_table_not_found_error(exc) and "incidents" in str(exc).lower():
+                fallback_sql = f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_json_rfincidentreports_co_noticeresults"
+                try:
+                    data["incidents"] = run_warehouse_query(server_hostname, http_path, access_token, fallback_sql)
+                except Exception:
+                    data["incidents"] = pd.DataFrame()
+            else:
+                raise
     if atendo_sql:
-        data["atendo"] = run_warehouse_query(server_hostname, http_path, access_token, atendo_sql)
+        try:
+            data["atendo"] = run_warehouse_query(server_hostname, http_path, access_token, atendo_sql)
+        except Exception as exc:
+            if _is_table_not_found_error(exc) and "atendo_accessibility" in str(exc).lower():
+                fallback_sql = (
+                    f"SELECT * FROM {DEFAULT_UC_CATALOG}.{DEFAULT_UC_SCHEMA}.bronze_csv_listado_de_estaciones_con_servicio_de_atendo"
+                )
+                try:
+                    data["atendo"] = run_warehouse_query(server_hostname, http_path, access_token, fallback_sql)
+                except Exception:
+                    data["atendo"] = pd.DataFrame()
+            else:
+                raise
 
     return data
 
@@ -696,7 +880,6 @@ def load_data_from_genie(space_id: str) -> tuple[dict[str, pd.DataFrame], list[s
 
 def render_genie_tab(space_id: str, title: str, key_prefix: str) -> None:
     st.subheader(title)
-    st.caption(f"Genie Space: `{space_id}`")
 
     conv_key = f"{key_prefix}_conversation_id"
     history_key = f"{key_prefix}_history"
@@ -721,7 +904,7 @@ def render_genie_tab(space_id: str, title: str, key_prefix: str) -> None:
 
     if send:
         if not space_id:
-            st.error("Missing Genie space ID.")
+            st.error("Genie is not configured for this environment.")
         elif not prompt.strip():
             st.warning("Enter a question for Genie.")
         else:
@@ -1339,75 +1522,43 @@ def render_ml_tab(data: dict[str, pd.DataFrame]) -> None:
         st.success(f"Predicted delay: {pred_seconds/60:.1f} minutes ({pred_seconds:.0f} seconds)")
 
 def main() -> None:
-    st.title("Renfe Train Analytics App")
-    st.caption("Analytics insights, maps, and operational dashboards sourced from Databricks SQL Warehouse.")
+    _apply_app_style()
 
-    st.sidebar.divider()
-    st.sidebar.subheader("Databricks SQL Warehouse")
-    genie_space_id = st.sidebar.text_input("Genie space ID", value=_default_genie_space_id())
-    genie_space_id_2 = st.sidebar.text_input("Genie space ID (Tab 2)", value=_default_genie_space_id_2())
-    db_host = st.sidebar.text_input(
-        "Server hostname",
-        value=_default_server_hostname(),
-    )
-    db_http_path = st.sidebar.text_input(
-        "HTTP path",
-        value=_default_http_path(),
-    )
-    db_token = st.sidebar.text_input(
-        "Access token (optional in Databricks Apps)",
-        value=os.getenv("DATABRICKS_TOKEN", ""),
-        type="password",
-    )
-    stations_sql = st.sidebar.text_area(
-        "Stations query",
-        value=st.session_state.get("stations_sql", GEO_QUERY_HINT),
-        height=120,
-    )
-    trip_sql = st.sidebar.text_area(
-        "Trip updates query",
-        value=st.session_state.get("trip_sql", TRIP_QUERY_HINT),
-        height=120,
-    )
-    vehicles_sql = st.sidebar.text_area(
-        "Vehicles query",
-        value=st.session_state.get("vehicles_sql", VEHICLES_QUERY_HINT),
-        height=120,
-    )
-    routes_sql = st.sidebar.text_area(
-        "Routes query",
-        value=st.session_state.get("routes_sql", ROUTES_QUERY_HINT),
-        height=90,
-    )
-    scheduled_trips_sql = st.sidebar.text_area(
-        "Scheduled trips query",
-        value=st.session_state.get("scheduled_trips_sql", SCHEDULED_TRIPS_QUERY_HINT),
-        height=90,
-    )
-    alerts_sql = st.sidebar.text_area(
-        "Alerts query",
-        value=st.session_state.get("alerts_sql", ALERTS_QUERY_HINT),
-        height=90,
-    )
-    incidents_sql = st.sidebar.text_area(
-        "Incidents query (optional)",
-        value=st.session_state.get("incidents_sql", INCIDENTS_QUERY_HINT),
-        height=90,
-    )
-    atendo_sql = st.sidebar.text_area(
-        "Atendo query (optional)",
-        value=st.session_state.get("atendo_sql", ATENDO_QUERY_HINT),
-        height=90,
-    )
-    st.session_state["stations_sql"] = stations_sql
-    st.session_state["trip_sql"] = trip_sql
-    st.session_state["vehicles_sql"] = vehicles_sql
-    st.session_state["routes_sql"] = routes_sql
-    st.session_state["scheduled_trips_sql"] = scheduled_trips_sql
-    st.session_state["alerts_sql"] = alerts_sql
-    st.session_state["incidents_sql"] = incidents_sql
-    st.session_state["atendo_sql"] = atendo_sql
-    refresh_sql = st.sidebar.button("Refresh warehouse data")
+    user_name = _current_user_name()
+    left, right = st.columns([0.78, 0.22])
+    with left:
+        st.markdown(
+            """
+            <div class="dbx-header">
+              <p class="dbx-title">Renfe Train Analytics</p>
+              <p class="dbx-subtitle">Operational insights, maps, dashboards, and ML predictions powered by Databricks SQL.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with right:
+        st.markdown(
+            f"<div style='text-align:right; padding-top: 10px;'><span class='dbx-user'>{user_name}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+    genie_space_id = _default_genie_space_id()
+    genie_space_id_2 = _default_genie_space_id_2()
+    db_host = _default_server_hostname()
+    db_http_path = _default_http_path()
+    db_token = os.getenv("DATABRICKS_TOKEN", "")
+    query_map = {
+        "stations": GEO_QUERY_HINT,
+        "trip_updates": TRIP_QUERY_HINT,
+        "vehicles": VEHICLES_QUERY_HINT,
+        "routes": ROUTES_QUERY_HINT,
+        "scheduled_trips": SCHEDULED_TRIPS_QUERY_HINT,
+        "alerts": ALERTS_QUERY_HINT,
+        "incidents": INCIDENTS_QUERY_HINT,
+        "atendo": ATENDO_QUERY_HINT,
+    }
+
+    refresh_sql = st.button("Refresh Data", type="primary")
 
     if "warehouse_data" not in st.session_state:
         st.session_state["warehouse_data"] = empty_data()
@@ -1415,17 +1566,6 @@ def main() -> None:
         st.session_state["warehouse_error"] = ""
     if "warehouse_loaded" not in st.session_state:
         st.session_state["warehouse_loaded"] = False
-    query_map = {
-        "stations": stations_sql,
-        "trip_updates": trip_sql,
-        "vehicles": vehicles_sql,
-        "routes": routes_sql,
-        "scheduled_trips": scheduled_trips_sql,
-        "alerts": alerts_sql,
-        "incidents": incidents_sql,
-        "atendo": atendo_sql,
-    }
-
     must_reload = refresh_sql or not st.session_state["warehouse_loaded"]
     if must_reload:
         st.session_state["warehouse_error"] = ""
@@ -1456,7 +1596,7 @@ def main() -> None:
     warehouse_error = st.session_state["warehouse_error"]
 
     tab_insights, tab_map, tab_dash, tab_insights_plus, tab_analytics_plus, tab_ml, tab_genie, tab_genie_2 = st.tabs(
-        ["Analytics Insights", "Maps", "Dashboards", "Insights+", "Analytics+", "ML Delay Prediction", "Genie", "Genie 2"]
+        ["Analytics Insights", "Maps", "Dashboards", "Insights+", "Analytics+", "ML Delay Prediction", "Train Expert", "Trips Expert"]
     )
     with tab_insights:
         if warehouse_error:
@@ -1476,7 +1616,7 @@ def main() -> None:
                 "Warehouse data loaded successfully."
             )
         st.caption(
-            "This app reads dashboard data from Databricks SQL Warehouse queries configured in the sidebar."
+            "Data is loaded from Databricks SQL Warehouse and preconfigured application queries."
         )
     with tab_insights_plus:
         if warehouse_error:
@@ -1491,9 +1631,9 @@ def main() -> None:
             st.error(warehouse_error)
         render_ml_tab(data)
     with tab_genie:
-        render_genie_tab(genie_space_id, "Genie Assistant", "genie1")
+        render_genie_tab(genie_space_id, "Train Expert", "genie1")
     with tab_genie_2:
-        render_genie_tab(genie_space_id_2, "Genie Assistant 2", "genie2")
+        render_genie_tab(genie_space_id_2, "Trips Expert", "genie2")
 
 
 if __name__ == "__main__":

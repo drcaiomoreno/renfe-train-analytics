@@ -61,103 +61,99 @@ def _sanitize_spark_columns(df: DataFrame) -> DataFrame:
     return df.toDF(*new_cols)
 
 
-def _build_specs() -> list[IngestionSpec]:
-    # All files are covered by one of these glob patterns.
-    return [
-        IngestionSpec(
-            table_name="bronze_json_top_level",
-            source_glob="*.json",
+def _csv_options_top_level() -> dict[str, str]:
+    return {
+        "header": "true",
+        "sep": ";",
+        "quote": '"',
+        "escape": '"',
+        "encoding": "ISO-8859-1",
+        "cloudFiles.inferColumnTypes": "false",
+        "cloudFiles.schemaEvolutionMode": "rescue",
+        "rescuedDataColumn": "_rescued_data",
+    }
+
+
+def _csv_options_gtfs() -> dict[str, str]:
+    return {
+        "header": "true",
+        "sep": ",",
+        "quote": '"',
+        "escape": '"',
+        "cloudFiles.inferColumnTypes": "false",
+        "cloudFiles.schemaEvolutionMode": "rescue",
+        "rescuedDataColumn": "_rescued_data",
+    }
+
+
+def _json_options() -> dict[str, str]:
+    return {
+        "cloudFiles.inferColumnTypes": "true",
+        "cloudFiles.schemaEvolutionMode": "addNewColumns",
+        "rescuedDataColumn": "_rescued_data",
+        "multiLine": "true",
+    }
+
+
+def _spec_for_file(rel_path: str) -> IngestionSpec | None:
+    p = Path(rel_path)
+    parent = p.parent.as_posix()
+    stem = _sanitize_name(p.stem)
+    ext = p.suffix.lower()
+
+    if ext == ".json":
+        return IngestionSpec(
+            table_name=f"bronze_json_{stem}",
+            source_glob=rel_path,
             source_format="json",
-            options={
-                "cloudFiles.inferColumnTypes": "true",
-                "cloudFiles.schemaEvolutionMode": "addNewColumns",
-                "rescuedDataColumn": "_rescued_data",
-                "multiLine": "true",
-            },
-            description="Top-level JSON files (alerts/trip updates/incidents/vehicle positions).",
-        ),
-        IngestionSpec(
-            table_name="bronze_csv_top_level_semicolon",
-            source_glob="*.csv",
+            options=_json_options(),
+            description=f"JSON source file: {rel_path}",
+        )
+
+    if ext == ".csv":
+        return IngestionSpec(
+            table_name=f"bronze_csv_{stem}",
+            source_glob=rel_path,
             source_format="csv",
-            options={
-                "header": "true",
-                "sep": ";",
-                "quote": '"',
-                "escape": '"',
-                "encoding": "ISO-8859-1",
-                "cloudFiles.inferColumnTypes": "false",
-                "cloudFiles.schemaEvolutionMode": "addNewColumns",
-                "rescuedDataColumn": "_rescued_data",
-            },
-            description="Top-level semicolon CSV files.",
-        ),
-        IngestionSpec(
-            table_name="bronze_google_transit_txt",
-            source_glob="google_transit/*.txt",
+            options=_csv_options_top_level(),
+            description=f"Top-level CSV source file: {rel_path}",
+        )
+
+    if ext == ".txt" and parent in {"google_transit", "fomento_transit", "horarios-feve"}:
+        return IngestionSpec(
+            table_name=f"bronze_{_sanitize_name(parent)}_{stem}",
+            source_glob=rel_path,
             source_format="csv",
-            options={
-                "header": "true",
-                "sep": ",",
-                "quote": '"',
-                "escape": '"',
-                "cloudFiles.inferColumnTypes": "false",
-                "cloudFiles.schemaEvolutionMode": "addNewColumns",
-                "rescuedDataColumn": "_rescued_data",
-            },
-            description="Google transit GTFS TXT files.",
-        ),
-        IngestionSpec(
-            table_name="bronze_fomento_transit_txt",
-            source_glob="fomento_transit/*.txt",
-            source_format="csv",
-            options={
-                "header": "true",
-                "sep": ",",
-                "quote": '"',
-                "escape": '"',
-                "cloudFiles.inferColumnTypes": "false",
-                "cloudFiles.schemaEvolutionMode": "addNewColumns",
-                "rescuedDataColumn": "_rescued_data",
-            },
-            description="Fomento transit GTFS TXT files.",
-        ),
-        IngestionSpec(
-            table_name="bronze_horarios_feve_txt",
-            source_glob="horarios-feve/*.txt",
-            source_format="csv",
-            options={
-                "header": "true",
-                "sep": ",",
-                "quote": '"',
-                "escape": '"',
-                "cloudFiles.inferColumnTypes": "false",
-                "cloudFiles.schemaEvolutionMode": "addNewColumns",
-                "rescuedDataColumn": "_rescued_data",
-            },
-            description="Horarios FEVE TXT files.",
-        ),
-        IngestionSpec(
-            table_name="bronze_binary_pb",
-            source_glob="*.pb",
+            options=_csv_options_gtfs(),
+            description=f"GTFS TXT source file: {rel_path}",
+        )
+
+    if ext in {".pb", ".xlsx"}:
+        return IngestionSpec(
+            table_name=f"bronze_binary_{stem}",
+            source_glob=rel_path,
             source_format="binaryFile",
             options={},
-            description="Protocol Buffer binaries.",
-        ),
-        IngestionSpec(
-            table_name="bronze_binary_xlsx",
-            source_glob="*.xlsx",
-            source_format="binaryFile",
-            options={},
-            description="Excel binaries.",
-        ),
-    ]
+            description=f"Binary source file: {rel_path}",
+        )
+
+    return None
+
+
+def _build_specs(source_base: str) -> list[IngestionSpec]:
+    files = _list_relative_files(source_base)
+    specs: list[IngestionSpec] = []
+    for rel in files:
+        spec = _spec_for_file(rel)
+        if spec:
+            specs.append(spec)
+    return specs
 
 
 def _with_lineage_columns(df: DataFrame, pattern: str, fmt: str) -> DataFrame:
     return (
         df.withColumn("_ingest_ts", F.current_timestamp())
-        .withColumn("_source_file_path", F.input_file_name())
+        .withColumn("_source_file_path", F.col("_metadata.file_path"))
         .withColumn("_source_pattern", F.lit(pattern))
         .withColumn("_source_format", F.lit(fmt))
     )
@@ -189,13 +185,14 @@ def _ingest_spec(
     df = _sanitize_spark_columns(df)
     df = _with_lineage_columns(df, spec.source_glob, spec.source_format)
 
-    (
+    query = (
         df.writeStream.format("delta")
         .option("checkpointLocation", checkpoint_loc)
         .option("mergeSchema", "true")
         .trigger(availableNow=True)
         .toTable(target_table)
     )
+    query.awaitTermination()
 
     count = spark.table(target_table).count()
     print(f"[OK] {target_table}: {count} rows ({spec.description})")
@@ -233,14 +230,33 @@ def main() -> None:
     parser.add_argument("--state-base", default=DEFAULT_STATE_BASE, help="Base path for Auto Loader schema/checkpoints.")
     parser.add_argument("--catalog", default=DEFAULT_CATALOG)
     parser.add_argument("--schema", default=DEFAULT_SCHEMA)
+    parser.add_argument(
+        "--create-catalog",
+        action="store_true",
+        help="Create catalog if missing (optional; requires metastore storage root or managed location).",
+    )
+    parser.add_argument(
+        "--catalog-managed-location",
+        default=None,
+        help="Managed location URI used only with --create-catalog.",
+    )
     parser.add_argument("--skip-coverage-check", action="store_true", help="Skip file-pattern coverage validation.")
     args = parser.parse_args()
 
     spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
-    spark.sql(f"CREATE CATALOG IF NOT EXISTS {args.catalog}")
+    if args.create_catalog:
+        if args.catalog_managed_location:
+            spark.sql(
+                f"CREATE CATALOG IF NOT EXISTS {args.catalog} "
+                f"MANAGED LOCATION '{args.catalog_managed_location}'"
+            )
+        else:
+            spark.sql(f"CREATE CATALOG IF NOT EXISTS {args.catalog}")
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {args.catalog}.{args.schema}")
 
-    specs = _build_specs()
+    specs = _build_specs(args.source_path)
+    if not specs:
+        raise RuntimeError(f"No supported files found under {args.source_path}")
     if not args.skip_coverage_check:
         _validate_pattern_coverage(args.source_path, specs)
 

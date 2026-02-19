@@ -8,6 +8,9 @@ variables:
   loader_node_type_id:
     description: Node type for loader job cluster.
     default: Standard_DS3_v2
+  loader_state_base:
+    description: Base DBFS path for Auto Loader schema/checkpoint state.
+    default: dbfs:/tmp/renfe_app_autoloader_state_v2
 
 sync:
   exclude:
@@ -48,6 +51,8 @@ resources:
             parameters:
               - --source-path
               - /Volumes/catalog_caiom7nmz_d9oink/renfe_app_data/renfe_app_data_files
+              - --state-base
+              - ${var.loader_state_base}
               - --catalog
               - catalog_caiom7nmz_d9oink
               - --schema
