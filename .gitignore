@@ -4,3 +4,9 @@ __pycache__/
 .venv/
 .databricks/
 data/
+
+# Local raw data
+data/
+
+# Local raw data
+data/
