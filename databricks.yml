@@ -16,10 +16,6 @@ sync:
     - __pycache__/
     - "*.pyc"
     - ".DS_Store"
-    - "data/*.zip"
-    - "data/fomento_transit/"
-    - "data/google_transit/stop_times.txt"
-    - "data/google_transit/calendar_dates.txt"
 
 resources:
   apps:
@@ -50,8 +46,8 @@ resources:
           spark_python_task:
             python_file: ${workspace.file_path}/scripts/load_renfe_files_to_uc.py
             parameters:
-              - --data-dir
-              - ${workspace.file_path}/data
+              - --source-path
+              - /Volumes/catalog_caiom7nmz_d9oink/renfe_app_data/renfe_app_data_files
               - --catalog
               - catalog_caiom7nmz_d9oink
               - --schema

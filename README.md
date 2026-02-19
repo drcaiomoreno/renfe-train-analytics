@@ -124,11 +124,11 @@ databricks bundle summary -t dev
 Scripts are available under `scripts/` to ingest all datasets used by the app into:
 `catalog_caiom7nmz_d9oink.renfe_app_data`
 
-Run on Databricks (cluster or serverless notebook with PySpark):
+Run on Databricks (cluster or serverless notebook with PySpark), reading directly from UC Volume:
 
 ```bash
 python scripts/load_renfe_files_to_uc.py \
-  --data-dir data \
+  --source-path /Volumes/catalog_caiom7nmz_d9oink/renfe_app_data/renfe_app_data_files \
   --catalog catalog_caiom7nmz_d9oink \
   --schema renfe_app_data
 ```
@@ -137,7 +137,7 @@ If the catalog does not exist and your metastore has no default storage root con
 
 ```bash
 python scripts/load_renfe_files_to_uc.py \
-  --data-dir data \
+  --source-path /Volumes/catalog_caiom7nmz_d9oink/renfe_app_data/renfe_app_data_files \
   --catalog catalog_caiom7nmz_d9oink \
   --schema renfe_app_data \
   --create-catalog \
