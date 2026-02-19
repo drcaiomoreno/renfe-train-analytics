@@ -27,43 +27,95 @@ st.set_page_config(
 )
 
 TRIP_QUERY_HINT = """
-SELECT trip_id, delay_seconds, timestamp, feed
-FROM catalog_caiom7nmz_d9oink.renfe_app_data.trip_updates_rt
+	SELECT
+	  entity_item.id AS entity_id,
+	  entity_item.tripUpdate.trip.tripId AS trip_id,
+	  COALESCE(
+	    entity_item.tripUpdate.delay,
+	    entity_item.tripUpdate.stopTimeUpdate[0].arrival.delay,
+	    0
+	  ) AS delay_seconds,
+	  to_timestamp(from_unixtime(try_cast(src.header.timestamp AS BIGINT))) AS timestamp,
+	  'Cercanias' AS feed
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_json_trip_updates src
+	LATERAL VIEW OUTER explode(src.entity) exp1 AS entity_item
+	UNION ALL
+	SELECT
+	  entity_ld_item.id AS entity_id,
+	  entity_ld_item.tripUpdate.trip.tripId AS trip_id,
+	  COALESCE(entity_ld_item.tripUpdate.delay, 0) AS delay_seconds,
+	  to_timestamp(from_unixtime(try_cast(src_ld.header.timestamp AS BIGINT))) AS timestamp,
+	  'LD' AS feed
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_json_trip_updates_ld src_ld
+	LATERAL VIEW OUTER explode(src_ld.entity) exp2 AS entity_ld_item
 """
 
 GEO_QUERY_HINT = """
-SELECT station_code, station_name, lat, lon, province, source
-FROM catalog_caiom7nmz_d9oink.renfe_app_data.stations_dim
+	SELECT codigo AS station_code, descripcion AS station_name, latitud AS lat, longitud AS lon, provincia, 'estaciones' AS source
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_csv_estaciones
+"""
+
+AVLD_QUERY_HINT = """
+	SELECT c_digo AS station_code, descripcion AS station_name, latitud AS lat, longitud AS lon, provincia, 'av_ld' AS source
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_csv_listado_completo_av_ld_md
+"""
+
+FEVE_QUERY_HINT = """
+	SELECT c_digo AS station_code, descripcion AS station_name, latitud AS lat, longitud AS lon, provincia, 'feve' AS source
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_csv_listado_de_estaciones_feve_2
+"""
+
+CERCANIAS_QUERY_HINT = """
+	SELECT c_digo AS station_code, descripcion AS station_name, latitud AS lat, longitud AS lon, provincia, 'cercanias_madrid' AS source
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_csv_listado_estaciones_cercanias_madrid
 """
 
 VEHICLES_QUERY_HINT = """
-SELECT trip_id, vehicle_id, vehicle_label, status, stop_id, lat, lon
-FROM catalog_caiom7nmz_d9oink.renfe_app_data.vehicle_positions_rt
+	SELECT
+	  entity_item.id AS entity_id,
+	  entity_item.vehicle.trip.tripId AS trip_id,
+	  entity_item.vehicle.vehicle.id AS vehicle_id,
+	  entity_item.vehicle.vehicle.label AS vehicle_label,
+	  entity_item.vehicle.currentStatus AS status,
+	  entity_item.vehicle.stopId AS stop_id,
+	  entity_item.vehicle.position.latitude AS lat,
+	  entity_item.vehicle.position.longitude AS lon
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_json_vehicle_positions src
+	LATERAL VIEW OUTER explode(src.entity) exp AS entity_item
 """
 
 ROUTES_QUERY_HINT = """
-SELECT route_id, route_short_name, route_type
-FROM catalog_caiom7nmz_d9oink.renfe_app_data.routes_dim
+	SELECT route_id, route_short_name, route_type
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_google_transit_routes
 """
 
 SCHEDULED_TRIPS_QUERY_HINT = """
-SELECT trip_id, route_id, direction_id
-FROM catalog_caiom7nmz_d9oink.renfe_app_data.trips_dim
+	SELECT trip_id, route_id, direction_id
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_google_transit_trips
 """
 
 ALERTS_QUERY_HINT = """
-SELECT id, route_count, description
-FROM catalog_caiom7nmz_d9oink.renfe_app_data.alerts_rt
+	SELECT
+	  entity_item.id AS id,
+	  size(entity_item.alert.informedEntity) AS route_count,
+	  entity_item.alert.descriptionText.translation[0].text AS description
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_json_alerts src
+	LATERAL VIEW OUTER explode(src.entity) exp AS entity_item
 """
 
 INCIDENTS_QUERY_HINT = """
-SELECT *
-FROM catalog_caiom7nmz_d9oink.renfe_app_data.incidents
+	SELECT *
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_json_rfincidentreports_co_noticeresults
 """
 
 ATENDO_QUERY_HINT = """
-SELECT *
-FROM catalog_caiom7nmz_d9oink.renfe_app_data.atendo_accessibility
+	SELECT *
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_csv_listado_de_estaciones_con_servicio_de_atendo
+"""
+
+TRAIN_INFO_QUERY_HINT = """
+	SELECT *
+	FROM catalog_caiom7nmz_d9oink.renfe_app_data.bronze_csv_informacion_trenes
 """
 
 DEFAULT_GENIE_SPACE_ID = "01f10d0ef5311278a6829ada8a43e5b7"
@@ -532,6 +584,9 @@ def normalize_alerts(df: pd.DataFrame) -> pd.DataFrame:
 def empty_data() -> dict[str, pd.DataFrame]:
     return {
         "stations": pd.DataFrame(columns=["station_code", "station_name", "lat", "lon", "province", "source"]),
+        "avld": pd.DataFrame(columns=["station_code", "station_name", "lat", "lon", "province", "source"]),
+        "feve": pd.DataFrame(columns=["station_code", "station_name", "lat", "lon", "province", "source"]),
+        "cercanias_madrid": pd.DataFrame(columns=["station_code", "station_name", "lat", "lon", "province", "source"]),
         "gtfs_stops": pd.DataFrame(),
         "gtfs_routes": pd.DataFrame(columns=["route_short_name"]),
         "gtfs_trips": pd.DataFrame(columns=["trip_id"]),
@@ -540,6 +595,7 @@ def empty_data() -> dict[str, pd.DataFrame]:
         "alerts": pd.DataFrame(columns=["id", "route_count", "description"]),
         "incidents": pd.DataFrame(),
         "atendo": pd.DataFrame(),
+        "train_info": pd.DataFrame(),
     }
 
 
@@ -559,6 +615,10 @@ def load_data_from_warehouse(
     alerts_sql = _clean_query(query_map.get("alerts", ""))
     incidents_sql = _clean_query(query_map.get("incidents", ""))
     atendo_sql = _clean_query(query_map.get("atendo", ""))
+    avld_sql = _clean_query(query_map.get("avld", ""))
+    feve_sql = _clean_query(query_map.get("feve", ""))
+    cercanias_sql = _clean_query(query_map.get("cercanias_madrid", ""))
+    train_info_sql = _clean_query(query_map.get("train_info", ""))
 
     def _is_table_not_found_error(exc: Exception) -> bool:
         return "TABLE_OR_VIEW_NOT_FOUND" in str(exc)
@@ -709,8 +769,223 @@ def load_data_from_warehouse(
                     data["atendo"] = pd.DataFrame()
             else:
                 raise
+    if avld_sql:
+        data["avld"] = normalize_geo_points(run_warehouse_query(server_hostname, http_path, access_token, avld_sql))
+    if feve_sql:
+        data["feve"] = normalize_geo_points(run_warehouse_query(server_hostname, http_path, access_token, feve_sql))
+    if cercanias_sql:
+        data["cercanias_madrid"] = normalize_geo_points(
+            run_warehouse_query(server_hostname, http_path, access_token, cercanias_sql)
+        )
+    if train_info_sql:
+        data["train_info"] = run_warehouse_query(server_hostname, http_path, access_token, train_info_sql)
 
     return data
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def load_table_inventory(server_hostname: str, http_path: str, access_token: str) -> pd.DataFrame:
+    sql = f"""
+    SELECT table_name, table_type, data_source_format
+    FROM {DEFAULT_UC_CATALOG}.information_schema.tables
+    WHERE table_schema = '{DEFAULT_UC_SCHEMA}'
+    ORDER BY table_name
+    """
+    inv = run_warehouse_query(server_hostname, http_path, access_token, _clean_query(sql))
+    if inv.empty:
+        return pd.DataFrame(columns=["table_name", "table_type", "data_source_format", "layer", "domain"])
+    out = inv.copy()
+    out["layer"] = np.where(out["table_name"].str.startswith("bronze_"), "Bronze", "Curated")
+    out["domain"] = out["table_name"].str.replace("bronze_", "", regex=False).str.split("_").str[0]
+    return out
+
+
+def apply_business_filters(
+    data: dict[str, pd.DataFrame],
+    provinces: list[str],
+    feeds: list[str],
+    route_types: list[str],
+    vehicle_statuses: list[str],
+    delay_min_range: tuple[int, int],
+) -> dict[str, pd.DataFrame]:
+    filtered = {k: v.copy() for k, v in data.items()}
+
+    if provinces and not filtered["stations"].empty and "province" in filtered["stations"].columns:
+        filtered["stations"] = filtered["stations"][filtered["stations"]["province"].astype(str).isin(provinces)]
+    if provinces and not filtered["avld"].empty and "province" in filtered["avld"].columns:
+        filtered["avld"] = filtered["avld"][filtered["avld"]["province"].astype(str).isin(provinces)]
+
+    if feeds and not filtered["trip_updates"].empty and "feed" in filtered["trip_updates"].columns:
+        filtered["trip_updates"] = filtered["trip_updates"][filtered["trip_updates"]["feed"].astype(str).isin(feeds)]
+
+    if not filtered["trip_updates"].empty and "delay_seconds" in filtered["trip_updates"].columns:
+        lo, hi = delay_min_range
+        mins = pd.to_numeric(filtered["trip_updates"]["delay_seconds"], errors="coerce") / 60.0
+        filtered["trip_updates"] = filtered["trip_updates"][(mins >= lo) & (mins <= hi)]
+
+    if route_types and not filtered["gtfs_routes"].empty and "route_type" in filtered["gtfs_routes"].columns:
+        filtered["gtfs_routes"] = filtered["gtfs_routes"][
+            filtered["gtfs_routes"]["route_type"].astype(str).isin(route_types)
+        ]
+
+    if vehicle_statuses and not filtered["vehicles"].empty and "status" in filtered["vehicles"].columns:
+        filtered["vehicles"] = filtered["vehicles"][filtered["vehicles"]["status"].astype(str).isin(vehicle_statuses)]
+
+    return filtered
+
+
+def build_station_master(data: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for key in ("stations", "avld", "feve", "cercanias_madrid"):
+        df = data.get(key, pd.DataFrame())
+        if df.empty:
+            continue
+        keep_cols = [c for c in ["station_code", "station_name", "lat", "lon", "province", "source"] if c in df.columns]
+        if keep_cols:
+            frames.append(df[keep_cols].copy())
+    if not frames:
+        return pd.DataFrame(columns=["station_code", "station_name", "lat", "lon", "province", "source"])
+    out = pd.concat(frames, ignore_index=True)
+    out["station_code"] = out["station_code"].astype(str).str.strip()
+    out["station_name"] = out["station_name"].astype(str).str.strip()
+    out = out.dropna(subset=["lat", "lon"])
+    return out.drop_duplicates(subset=["station_code", "station_name", "lat", "lon", "source"])
+
+
+def render_csv_overview(data: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Renfe CSV Data Overview")
+    stations = build_station_master(data)
+    atendo = data["atendo"]
+    train_info = data["train_info"]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Stations", f"{stations['station_code'].nunique():,}" if not stations.empty else "0")
+    c2.metric("Provinces", f"{stations['province'].astype(str).nunique():,}" if not stations.empty else "0")
+    c3.metric("Atendo Stations", f"{len(atendo):,}")
+    c4.metric("Train Models", f"{train_info.get('modelo', pd.Series(dtype=str)).astype(str).nunique():,}" if not train_info.empty else "0")
+
+    left, right = st.columns(2)
+    with left:
+        if not stations.empty and "province" in stations.columns:
+            by_prov = (
+                stations.assign(province=stations["province"].astype(str).replace("", "Unknown"))
+                .groupby("province", as_index=False)
+                .size()
+                .rename(columns={"size": "stations"})
+                .sort_values("stations", ascending=False)
+                .head(20)
+            )
+            st.plotly_chart(px.bar(by_prov, x="province", y="stations", title="Top Provinces by Stations"), use_container_width=True)
+        else:
+            st.info("No station data available.")
+    with right:
+        if not train_info.empty and "constructor" in train_info.columns:
+            by_builder = (
+                train_info.assign(constructor=train_info["constructor"].astype(str).replace("", "Unknown"))
+                .groupby("constructor", as_index=False)
+                .size()
+                .rename(columns={"size": "models"})
+                .sort_values("models", ascending=False)
+                .head(15)
+            )
+            st.plotly_chart(px.bar(by_builder, x="constructor", y="models", title="Train Models by Constructor"), use_container_width=True)
+        else:
+            st.info("No train model data available.")
+
+
+def render_csv_map(data: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Stations Map")
+    stations = build_station_master(data)
+    if stations.empty:
+        st.info("No stations with coordinates to display.")
+        return
+    stations = stations.copy()
+    stations["lat"] = pd.to_numeric(stations["lat"], errors="coerce")
+    stations["lon"] = pd.to_numeric(stations["lon"], errors="coerce")
+    stations = stations.dropna(subset=["lat", "lon"])
+    # Keep map centered on Spain mainland + islands bounds.
+    stations = stations[
+        (stations["lat"] >= 27.0)
+        & (stations["lat"] <= 44.5)
+        & (stations["lon"] >= -19.5)
+        & (stations["lon"] <= 5.5)
+    ]
+    if stations.empty:
+        st.info("No station coordinates inside Spain bounds.")
+        return
+    view_state = pdk.ViewState(
+        latitude=float(stations["lat"].astype(float).mean()),
+        longitude=float(stations["lon"].astype(float).mean()),
+        zoom=5.2,
+        pitch=0,
+    )
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=stations,
+        get_position="[lon, lat]",
+        get_radius=5000,
+        get_fill_color="[255, 140, 0, 140]",
+        pickable=True,
+    )
+    tooltip = {"html": "<b>{station_name}</b><br/>Code: {station_code}<br/>Province: {province}<br/>Source: {source}"}
+    st.pydeck_chart(
+        pdk.Deck(
+            map_provider="carto",
+            map_style="light",
+            initial_view_state=view_state,
+            layers=[layer],
+            tooltip=tooltip,
+        )
+    )
+
+
+def render_csv_accessibility(data: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Atendo Accessibility")
+    atendo = data["atendo"].copy()
+    if atendo.empty:
+        st.info("No Atendo records available.")
+        return
+    yes_cols = [c for c in ["aparcamiento", "and_n", "aseos", "vest_bulo"] if c in atendo.columns]
+    if yes_cols:
+        scores = []
+        for c in yes_cols:
+            val = atendo[c].astype(str).str.lower().str.contains("si|yes|x|1", regex=True, na=False).sum()
+            scores.append({"feature": c, "stations": int(val)})
+        feat_df = pd.DataFrame(scores).sort_values("stations", ascending=False)
+        st.plotly_chart(px.bar(feat_df, x="feature", y="stations", title="Accessibility Features Coverage"), use_container_width=True)
+    delay_col = "tiempo_de_antelacion" if "tiempo_de_antelacion" in atendo.columns else None
+    if delay_col:
+        dist = atendo[delay_col].astype(str).replace("", "Unknown").value_counts().reset_index(name="count")
+        dist.columns = ["lead_time", "count"]
+        st.plotly_chart(px.pie(dist, names="lead_time", values="count", title="Atendo Lead Time Distribution"), use_container_width=True)
+
+
+def render_csv_fleet(data: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Train Fleet & Specs")
+    df = data["train_info"].copy()
+    if df.empty:
+        st.info("No train information data available.")
+        return
+    left, right = st.columns(2)
+    with left:
+        if "velocidad_maxima" in df.columns:
+            speeds = pd.to_numeric(
+                df["velocidad_maxima"].astype(str).str.extract(r"(\d+[\.,]?\d*)")[0].str.replace(",", ".", regex=False),
+                errors="coerce",
+            )
+            sp = pd.DataFrame({"speed": speeds}).dropna()
+            if not sp.empty:
+                st.plotly_chart(px.histogram(sp, x="speed", nbins=20, title="Max Speed Distribution"), use_container_width=True)
+    with right:
+        if "proposito" in df.columns:
+            purpose = (
+                df["proposito"].astype(str).replace("", "Unknown").value_counts().head(15).reset_index(name="models")
+            )
+            purpose.columns = ["purpose", "models"]
+            st.plotly_chart(px.bar(purpose, x="purpose", y="models", title="Train Purpose Mix"), use_container_width=True)
+    show_cols = [c for c in ["modelo", "constructor", "velocidad_maxima", "plazas_sentadas", "proposito"] if c in df.columns]
+    if show_cols:
+        st.dataframe(df[show_cols].head(100), use_container_width=True, hide_index=True)
 
 
 def _statement_response_to_df(statement_response: Any) -> pd.DataFrame:
@@ -1226,6 +1501,87 @@ def render_analytics_plus(data: dict[str, pd.DataFrame]) -> None:
             st.info("No scheduled trip catalog available.")
 
 
+def render_operations_dashboard(data: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Operations Command Center")
+    trips = data["trip_updates"].copy()
+    vehicles = data["vehicles"].copy()
+    routes = data["gtfs_routes"].copy()
+    scheduled = data["gtfs_trips"].copy()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Live Trip Updates", f"{len(trips):,}")
+    c2.metric("Live Vehicle Positions", f"{len(vehicles):,}")
+    c3.metric("Scheduled Trips", f"{len(scheduled):,}")
+
+    if not trips.empty:
+        t = trips.copy()
+        t["delay_seconds"] = pd.to_numeric(t["delay_seconds"], errors="coerce").fillna(0)
+        t["delay_min"] = (t["delay_seconds"] / 60.0).round(2)
+        t["timestamp"] = pd.to_datetime(t.get("timestamp"), errors="coerce")
+        t["hour"] = t["timestamp"].dt.hour.fillna(-1).astype(int)
+        by_hour = t.groupby("hour", as_index=False)["delay_min"].mean()
+        fig_hour = px.line(by_hour, x="hour", y="delay_min", markers=True, title="Average Delay by Hour")
+        st.plotly_chart(fig_hour, use_container_width=True)
+    else:
+        st.info("No trip update data available.")
+
+    col_left, col_right = st.columns(2)
+    with col_left:
+        if not vehicles.empty and "status" in vehicles.columns:
+            status_df = (
+                vehicles.assign(status=vehicles["status"].astype(str).replace("", "UNKNOWN"))
+                .groupby("status", as_index=False)
+                .size()
+                .rename(columns={"size": "count"})
+            )
+            fig_status = px.bar(status_df, x="status", y="count", title="Vehicle Status Distribution")
+            st.plotly_chart(fig_status, use_container_width=True)
+        else:
+            st.info("Vehicle status data not available.")
+
+    with col_right:
+        if not routes.empty and "route_short_name" in routes.columns:
+            top_routes = (
+                routes.assign(route_short_name=routes["route_short_name"].astype(str))
+                .groupby("route_short_name", as_index=False)
+                .size()
+                .rename(columns={"size": "count"})
+                .sort_values("count", ascending=False)
+                .head(15)
+            )
+            fig_routes = px.bar(
+                top_routes.sort_values("count"),
+                x="count",
+                y="route_short_name",
+                orientation="h",
+                title="Top Route Families",
+            )
+            st.plotly_chart(fig_routes, use_container_width=True)
+        else:
+            st.info("Route data not available.")
+
+
+def render_table_inventory(table_inventory: pd.DataFrame) -> None:
+    st.subheader("Unity Catalog Table Inventory")
+    if table_inventory.empty:
+        st.warning("Could not retrieve table inventory from Unity Catalog.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Tables", f"{len(table_inventory):,}")
+    c2.metric("Bronze Tables", f"{int((table_inventory['layer'] == 'Bronze').sum()):,}")
+    c3.metric("Domains", f"{table_inventory['domain'].nunique():,}")
+
+    by_domain = (
+        table_inventory.groupby(["domain", "layer"], as_index=False)
+        .size()
+        .rename(columns={"size": "tables"})
+    )
+    fig_domain = px.bar(by_domain, x="domain", y="tables", color="layer", barmode="group", title="Tables by Domain")
+    st.plotly_chart(fig_domain, use_container_width=True)
+    st.dataframe(table_inventory, use_container_width=True, hide_index=True)
+
+
 def _build_ml_dataset(
     trip_updates: pd.DataFrame,
     gtfs_trips: pd.DataFrame,
@@ -1531,7 +1887,7 @@ def main() -> None:
             """
             <div class="dbx-header">
               <p class="dbx-title">Renfe Train Analytics</p>
-              <p class="dbx-subtitle">Operational insights, maps, dashboards, and ML predictions powered by Databricks SQL.</p>
+              <p class="dbx-subtitle">Operational insights, maps, dashboards powered by Databricks.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1543,19 +1899,16 @@ def main() -> None:
         )
 
     genie_space_id = _default_genie_space_id()
-    genie_space_id_2 = _default_genie_space_id_2()
     db_host = _default_server_hostname()
     db_http_path = _default_http_path()
     db_token = os.getenv("DATABRICKS_TOKEN", "")
     query_map = {
         "stations": GEO_QUERY_HINT,
-        "trip_updates": TRIP_QUERY_HINT,
-        "vehicles": VEHICLES_QUERY_HINT,
-        "routes": ROUTES_QUERY_HINT,
-        "scheduled_trips": SCHEDULED_TRIPS_QUERY_HINT,
-        "alerts": ALERTS_QUERY_HINT,
-        "incidents": INCIDENTS_QUERY_HINT,
+        "avld": AVLD_QUERY_HINT,
+        "feve": FEVE_QUERY_HINT,
+        "cercanias_madrid": CERCANIAS_QUERY_HINT,
         "atendo": ATENDO_QUERY_HINT,
+        "train_info": TRAIN_INFO_QUERY_HINT,
     }
 
     refresh_sql = st.button("Refresh Data", type="primary")
@@ -1595,45 +1948,85 @@ def main() -> None:
     data = st.session_state["warehouse_data"]
     warehouse_error = st.session_state["warehouse_error"]
 
-    tab_insights, tab_map, tab_dash, tab_insights_plus, tab_analytics_plus, tab_ml, tab_genie, tab_genie_2 = st.tabs(
-        ["Analytics Insights", "Maps", "Dashboards", "Insights+", "Analytics+", "ML Delay Prediction", "Train Expert", "Trips Expert"]
+    table_inventory = pd.DataFrame()
+    if not warehouse_error:
+        try:
+            table_inventory = load_table_inventory(db_host, db_http_path, db_token)
+        except Exception:
+            table_inventory = pd.DataFrame()
+
+    station_master = build_station_master(data)
+    st.sidebar.header("Business Filters")
+    province_options = (
+        sorted(station_master["province"].dropna().astype(str).unique().tolist())
+        if not station_master.empty and "province" in station_master.columns
+        else []
     )
-    with tab_insights:
+    source_options = (
+        sorted(station_master["source"].dropna().astype(str).unique().tolist())
+        if not station_master.empty and "source" in station_master.columns
+        else []
+    )
+    constructor_options = (
+        sorted(data["train_info"]["constructor"].dropna().astype(str).unique().tolist())
+        if not data["train_info"].empty and "constructor" in data["train_info"].columns
+        else []
+    )
+
+    selected_provinces = st.sidebar.multiselect("Province", province_options)
+    selected_sources = st.sidebar.multiselect("Station Source", source_options)
+    selected_constructors = st.sidebar.multiselect("Train Constructor", constructor_options)
+    delay_range = (0, 180)
+
+    filtered_data = apply_business_filters(
+        data=data,
+        provinces=selected_provinces,
+        feeds=[],
+        route_types=[],
+        vehicle_statuses=[],
+        delay_min_range=delay_range,
+    )
+    if selected_sources:
+        for key in ("stations", "avld"):
+            if not filtered_data[key].empty and "source" in filtered_data[key].columns:
+                filtered_data[key] = filtered_data[key][filtered_data[key]["source"].astype(str).isin(selected_sources)]
+    if selected_constructors and not filtered_data["train_info"].empty and "constructor" in filtered_data["train_info"].columns:
+        filtered_data["train_info"] = filtered_data["train_info"][
+            filtered_data["train_info"]["constructor"].astype(str).isin(selected_constructors)
+        ]
+
+    tab_overview, tab_map, tab_accessibility, tab_fleet, tab_inventory, tab_genie = st.tabs(
+        [
+            "Overview",
+            "Maps",
+            "Accessibility",
+            "Fleet",
+            "Table Inventory",
+            "Train Expert",
+        ]
+    )
+    with tab_overview:
         if warehouse_error:
             st.error(warehouse_error)
-        render_insights(data)
+        render_csv_overview(filtered_data)
     with tab_map:
         if warehouse_error:
             st.error(warehouse_error)
-        render_map(data)
-    with tab_dash:
-        render_dashboards(data)
-        st.subheader("Warehouse Status")
+        render_csv_map(filtered_data)
+    with tab_accessibility:
         if warehouse_error:
             st.error(warehouse_error)
-        else:
-            st.success(
-                "Warehouse data loaded successfully."
-            )
-        st.caption(
-            "Data is loaded from Databricks SQL Warehouse and preconfigured application queries."
-        )
-    with tab_insights_plus:
+        render_csv_accessibility(filtered_data)
+    with tab_fleet:
         if warehouse_error:
             st.error(warehouse_error)
-        render_insights_plus(data)
-    with tab_analytics_plus:
+        render_csv_fleet(filtered_data)
+    with tab_inventory:
         if warehouse_error:
             st.error(warehouse_error)
-        render_analytics_plus(data)
-    with tab_ml:
-        if warehouse_error:
-            st.error(warehouse_error)
-        render_ml_tab(data)
+        render_table_inventory(table_inventory)
     with tab_genie:
         render_genie_tab(genie_space_id, "Train Expert", "genie1")
-    with tab_genie_2:
-        render_genie_tab(genie_space_id_2, "Trips Expert", "genie2")
 
 
 if __name__ == "__main__":
