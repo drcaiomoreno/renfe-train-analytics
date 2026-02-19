@@ -1,6 +1,14 @@
 bundle:
   name: renfe-train-analytics
 
+variables:
+  loader_spark_version:
+    description: Spark runtime for loader job cluster.
+    default: 15.4.x-scala2.12
+  loader_node_type_id:
+    description: Node type for loader job cluster.
+    default: Standard_DS3_v2
+
 sync:
   exclude:
     - .git/
@@ -10,7 +18,8 @@ sync:
     - ".DS_Store"
     - "data/*.zip"
     - "data/fomento_transit/"
-    - "data/google_transit/"
+    - "data/google_transit/stop_times.txt"
+    - "data/google_transit/calendar_dates.txt"
 
 resources:
   apps:
@@ -18,6 +27,40 @@ resources:
       name: renfe-train-analytics-${bundle.target}
       description: Renfe analytics Streamlit app deployed with Databricks Asset Bundles.
       source_code_path: .
+      resources:
+        - name: sql_warehouse
+          sql_warehouse:
+            id: 0d64f16e913a0097
+            permission: CAN_USE
+        - name: renfe_genie_space
+          genie_space:
+            name: renfe-genie-room
+            space_id: 01f10d0ef5311278a6829ada8a43e5b7
+            permission: CAN_RUN
+        - name: renfe_genie_space_2
+          genie_space:
+            name: renfe-genie-room-2
+            space_id: 01f10d2386d41be4a33a652f9e3cf521
+            permission: CAN_RUN
+  jobs:
+    load_renfe_to_uc_job:
+      name: renfe-load-renfe-to-uc-${bundle.target}
+      tasks:
+        - task_key: load_renfe_files
+          spark_python_task:
+            python_file: ${workspace.file_path}/scripts/load_renfe_files_to_uc.py
+            parameters:
+              - --data-dir
+              - ${workspace.file_path}/data
+              - --catalog
+              - catalog_caiom7nmz_d9oink
+              - --schema
+              - renfe_app_data
+          new_cluster:
+            spark_version: ${var.loader_spark_version}
+            node_type_id: ${var.loader_node_type_id}
+            num_workers: 1
+            data_security_mode: USER_ISOLATION
 
 targets:
   dev:

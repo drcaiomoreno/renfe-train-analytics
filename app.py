@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import datetime
 import json
 import os
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import pydeck as pdk
 import streamlit as st
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
 
 
 st.set_page_config(
@@ -17,20 +26,48 @@ st.set_page_config(
     layout="wide",
 )
 
-TRIP_QUERY_HINT = """-- Return columns like: trip_id, delay_seconds, timestamp (optional), feed (optional)
--- Example:
--- SELECT trip_id, delay_seconds, event_time AS timestamp
--- FROM catalog.schema.train_delay_events
--- WHERE event_time >= current_timestamp() - INTERVAL 2 HOURS
--- LIMIT 2000
+TRIP_QUERY_HINT = """
+SELECT trip_id, delay_seconds, timestamp, feed
+FROM catalog_caiom7nmz_d9oink.renfe_app_data.trip_updates_rt
 """
 
-GEO_QUERY_HINT = """-- Return columns like: lat, lon, station_name (optional), province (optional), source (optional)
--- Example:
--- SELECT latitude AS lat, longitude AS lon, station_name, province
--- FROM catalog.schema.station_activity
--- LIMIT 5000
+GEO_QUERY_HINT = """
+SELECT station_code, station_name, lat, lon, province, source
+FROM catalog_caiom7nmz_d9oink.renfe_app_data.stations_dim
 """
+
+VEHICLES_QUERY_HINT = """
+SELECT trip_id, vehicle_id, vehicle_label, status, stop_id, lat, lon
+FROM catalog_caiom7nmz_d9oink.renfe_app_data.vehicle_positions_rt
+"""
+
+ROUTES_QUERY_HINT = """
+SELECT route_id, route_short_name, route_type
+FROM catalog_caiom7nmz_d9oink.renfe_app_data.routes_dim
+"""
+
+SCHEDULED_TRIPS_QUERY_HINT = """
+SELECT trip_id, route_id, direction_id
+FROM catalog_caiom7nmz_d9oink.renfe_app_data.trips_dim
+"""
+
+ALERTS_QUERY_HINT = """
+SELECT id, route_count, description
+FROM catalog_caiom7nmz_d9oink.renfe_app_data.alerts_rt
+"""
+
+INCIDENTS_QUERY_HINT = """
+SELECT *
+FROM catalog_caiom7nmz_d9oink.renfe_app_data.incidents
+"""
+
+ATENDO_QUERY_HINT = """
+SELECT *
+FROM catalog_caiom7nmz_d9oink.renfe_app_data.atendo_accessibility
+"""
+
+DEFAULT_GENIE_SPACE_ID = "01f10d0ef5311278a6829ada8a43e5b7"
+DEFAULT_GENIE_SPACE_ID_2 = "01f10d2386d41be4a33a652f9e3cf521"
 
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -59,6 +96,43 @@ def _clean_query(text: str) -> str:
             continue
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+def _normalize_server_hostname(host: str) -> str:
+    value = (host or "").strip()
+    if value.startswith("https://"):
+        value = value[len("https://") :]
+    elif value.startswith("http://"):
+        value = value[len("http://") :]
+    return value.split("/", 1)[0].strip()
+
+
+def _default_server_hostname() -> str:
+    return _normalize_server_hostname(
+        os.getenv("DATABRICKS_SERVER_HOSTNAME", "") or os.getenv("DATABRICKS_HOST", "")
+    )
+
+
+def _default_http_path() -> str:
+    explicit = os.getenv("DATABRICKS_HTTP_PATH", "").strip()
+    if explicit:
+        return explicit
+    warehouse_id = os.getenv("WAREHOUSE_ID", "").strip()
+    if warehouse_id:
+        return f"/sql/1.0/warehouses/{warehouse_id}"
+    return ""
+
+
+def _has_app_oauth_credentials() -> bool:
+    return bool(os.getenv("DATABRICKS_CLIENT_ID") and os.getenv("DATABRICKS_CLIENT_SECRET"))
+
+
+def _default_genie_space_id() -> str:
+    return (os.getenv("GENIE_SPACE_ID", "") or DEFAULT_GENIE_SPACE_ID).strip()
+
+
+def _default_genie_space_id_2() -> str:
+    return (os.getenv("GENIE_SPACE_ID_2", "") or DEFAULT_GENIE_SPACE_ID_2).strip()
 
 
 def _read_csv_flexible(path: Path, sep: str = ";") -> pd.DataFrame:
@@ -235,12 +309,24 @@ def load_data(data_dir: str) -> dict[str, pd.DataFrame]:
 @st.cache_data(show_spinner=False, ttl=120)
 def run_warehouse_query(server_hostname: str, http_path: str, access_token: str, query: str) -> pd.DataFrame:
     from databricks import sql as dbsql
+    from databricks.sdk.core import Config
 
-    with dbsql.connect(
-        server_hostname=server_hostname,
-        http_path=http_path,
-        access_token=access_token,
-    ) as connection:
+    clean_host = _normalize_server_hostname(server_hostname)
+    clean_http_path = (http_path or "").strip()
+    token = (access_token or "").strip()
+
+    connect_kwargs: dict[str, Any] = {
+        "server_hostname": clean_host,
+        "http_path": clean_http_path,
+    }
+    if token:
+        connect_kwargs["access_token"] = token
+    else:
+        cfg = Config()
+        connect_kwargs["server_hostname"] = clean_host or _normalize_server_hostname(cfg.host)
+        connect_kwargs["credentials_provider"] = lambda: cfg.authenticate
+
+    with dbsql.connect(**connect_kwargs) as connection:
         with connection.cursor() as cursor:
             cursor.execute(query)
             if cursor.description is None:
@@ -302,6 +388,372 @@ def normalize_geo_points(df: pd.DataFrame) -> pd.DataFrame:
         }
     )
     return out.dropna(subset=["lat", "lon"])
+
+
+def normalize_vehicles(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["entity_id", "trip_id", "vehicle_id", "vehicle_label", "status", "stop_id", "lat", "lon"])
+
+    lat_col = _pick_col(df, ["lat", "latitude"])
+    lon_col = _pick_col(df, ["lon", "lng", "longitude"])
+    if not lat_col or not lon_col:
+        return pd.DataFrame(columns=["entity_id", "trip_id", "vehicle_id", "vehicle_label", "status", "stop_id", "lat", "lon"])
+
+    entity_col = _pick_col(df, ["entity_id", "id"])
+    trip_col = _pick_col(df, ["trip_id", "tripid"])
+    vehicle_id_col = _pick_col(df, ["vehicle_id", "id_vehiculo", "veh_id"])
+    vehicle_label_col = _pick_col(df, ["vehicle_label", "label", "name"])
+    status_col = _pick_col(df, ["status", "current_status"])
+    stop_col = _pick_col(df, ["stop_id", "station_code"])
+
+    out = pd.DataFrame(
+        {
+            "entity_id": df[entity_col].astype(str) if entity_col else "",
+            "trip_id": df[trip_col].astype(str) if trip_col else "",
+            "vehicle_id": df[vehicle_id_col].astype(str) if vehicle_id_col else "",
+            "vehicle_label": df[vehicle_label_col].astype(str) if vehicle_label_col else "",
+            "status": df[status_col].astype(str) if status_col else "",
+            "stop_id": df[stop_col].astype(str) if stop_col else "",
+            "lat": pd.to_numeric(df[lat_col], errors="coerce"),
+            "lon": pd.to_numeric(df[lon_col], errors="coerce"),
+        }
+    )
+    return out.dropna(subset=["lat", "lon"])
+
+
+def normalize_routes(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["route_id", "route_short_name", "route_type"])
+    route_id_col = _pick_col(df, ["route_id", "id"])
+    route_name_col = _pick_col(df, ["route_short_name", "service", "route_name", "line"])
+    route_type_col = _pick_col(df, ["route_type", "type"])
+
+    out = pd.DataFrame(
+        {
+            "route_id": df[route_id_col].astype(str) if route_id_col else "",
+            "route_short_name": df[route_name_col].astype(str) if route_name_col else "Unknown",
+            "route_type": df[route_type_col].astype(str) if route_type_col else "Unknown",
+        }
+    )
+    return out
+
+
+def normalize_scheduled_trips(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["trip_id", "route_id", "direction_id"])
+    trip_col = _pick_col(df, ["trip_id", "tripid", "id"])
+    route_id_col = _pick_col(df, ["route_id"])
+    direction_col = _pick_col(df, ["direction_id"])
+    if not trip_col:
+        trip_col = df.columns[0]
+    return pd.DataFrame(
+        {
+            "trip_id": df[trip_col].astype(str),
+            "route_id": df[route_id_col].astype(str) if route_id_col else "",
+            "direction_id": pd.to_numeric(df[direction_col], errors="coerce").fillna(0).astype(int)
+            if direction_col
+            else 0,
+        }
+    )
+
+
+def normalize_alerts(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["id", "route_count", "description"])
+    id_col = _pick_col(df, ["id", "alert_id"])
+    route_count_col = _pick_col(df, ["route_count", "affected_routes"])
+    desc_col = _pick_col(df, ["description", "text", "message"])
+
+    out = pd.DataFrame(
+        {
+            "id": df[id_col].astype(str) if id_col else "",
+            "route_count": pd.to_numeric(df[route_count_col], errors="coerce").fillna(0).astype(int)
+            if route_count_col
+            else 0,
+            "description": df[desc_col].astype(str) if desc_col else "",
+        }
+    )
+    return out
+
+
+def empty_data() -> dict[str, pd.DataFrame]:
+    return {
+        "stations": pd.DataFrame(columns=["station_code", "station_name", "lat", "lon", "province", "source"]),
+        "gtfs_stops": pd.DataFrame(),
+        "gtfs_routes": pd.DataFrame(columns=["route_short_name"]),
+        "gtfs_trips": pd.DataFrame(columns=["trip_id"]),
+        "trip_updates": pd.DataFrame(columns=["feed", "entity_id", "trip_id", "delay_seconds", "timestamp"]),
+        "vehicles": pd.DataFrame(columns=["entity_id", "trip_id", "vehicle_id", "vehicle_label", "status", "stop_id", "lat", "lon"]),
+        "alerts": pd.DataFrame(columns=["id", "route_count", "description"]),
+        "incidents": pd.DataFrame(),
+        "atendo": pd.DataFrame(),
+    }
+
+
+def load_data_from_warehouse(
+    server_hostname: str,
+    http_path: str,
+    access_token: str,
+    query_map: dict[str, str],
+) -> dict[str, pd.DataFrame]:
+    data = empty_data()
+
+    stations_sql = _clean_query(query_map.get("stations", ""))
+    trips_sql = _clean_query(query_map.get("trip_updates", ""))
+    vehicles_sql = _clean_query(query_map.get("vehicles", ""))
+    routes_sql = _clean_query(query_map.get("routes", ""))
+    scheduled_trips_sql = _clean_query(query_map.get("scheduled_trips", ""))
+    alerts_sql = _clean_query(query_map.get("alerts", ""))
+    incidents_sql = _clean_query(query_map.get("incidents", ""))
+    atendo_sql = _clean_query(query_map.get("atendo", ""))
+
+    if stations_sql:
+        data["stations"] = normalize_geo_points(run_warehouse_query(server_hostname, http_path, access_token, stations_sql))
+    if trips_sql:
+        data["trip_updates"] = normalize_trip_updates(run_warehouse_query(server_hostname, http_path, access_token, trips_sql))
+    if vehicles_sql:
+        data["vehicles"] = normalize_vehicles(run_warehouse_query(server_hostname, http_path, access_token, vehicles_sql))
+    if routes_sql:
+        data["gtfs_routes"] = normalize_routes(run_warehouse_query(server_hostname, http_path, access_token, routes_sql))
+    if scheduled_trips_sql:
+        data["gtfs_trips"] = normalize_scheduled_trips(
+            run_warehouse_query(server_hostname, http_path, access_token, scheduled_trips_sql)
+        )
+    if alerts_sql:
+        data["alerts"] = normalize_alerts(run_warehouse_query(server_hostname, http_path, access_token, alerts_sql))
+    if incidents_sql:
+        data["incidents"] = run_warehouse_query(server_hostname, http_path, access_token, incidents_sql)
+    if atendo_sql:
+        data["atendo"] = run_warehouse_query(server_hostname, http_path, access_token, atendo_sql)
+
+    return data
+
+
+def _statement_response_to_df(statement_response: Any) -> pd.DataFrame:
+    if statement_response is None or statement_response.manifest is None:
+        return pd.DataFrame()
+    schema = statement_response.manifest.schema
+    columns = [c.name or f"col_{i}" for i, c in enumerate(schema.columns or [])]
+    data_array = statement_response.result.data_array if statement_response.result else []
+    return pd.DataFrame(data_array or [], columns=columns)
+
+
+def _run_genie_prompt(
+    space_id: str,
+    prompt: str,
+    conversation_id: str | None = None,
+    timeout_seconds: int = 60,
+) -> tuple[pd.DataFrame, str | None, str]:
+    from databricks.sdk import WorkspaceClient
+
+    w = WorkspaceClient()
+    timeout = datetime.timedelta(seconds=timeout_seconds)
+    if conversation_id:
+        msg = w.genie.create_message_and_wait(space_id=space_id, conversation_id=conversation_id, content=prompt, timeout=timeout)
+    else:
+        msg = w.genie.start_conversation_and_wait(space_id=space_id, content=prompt, timeout=timeout)
+
+    conv_id = getattr(msg, "conversation_id", None)
+    message_id = getattr(msg, "id", None) or getattr(msg, "message_id", None)
+    if not conv_id or not message_id:
+        return pd.DataFrame(), conv_id, msg.content or ""
+
+    response = None
+    for attachment in msg.attachments or []:
+        attachment_id = (
+            getattr(attachment, "attachment_id", None)
+            or getattr(attachment, "id", None)
+            or getattr(getattr(attachment, "query", None), "id", None)
+        )
+        if getattr(attachment, "query", None) and attachment_id:
+            response = w.genie.get_message_query_result_by_attachment(
+                space_id=space_id,
+                conversation_id=conv_id,
+                message_id=message_id,
+                attachment_id=attachment_id,
+            )
+            break
+    if response is None:
+        response = w.genie.get_message_query_result(
+            space_id=space_id,
+            conversation_id=conv_id,
+            message_id=message_id,
+        )
+    return _statement_response_to_df(response.statement_response), conv_id, msg.content or ""
+
+
+def _run_genie_chat_prompt(
+    space_id: str,
+    prompt: str,
+    conversation_id: str | None = None,
+    timeout_seconds: int = 60,
+) -> tuple[str, str | None]:
+    from databricks.sdk import WorkspaceClient
+
+    def _extract_text(msg: Any) -> str:
+        parts: list[str] = []
+        content = (getattr(msg, "content", None) or "").strip()
+        if content:
+            parts.append(content)
+        for attachment in getattr(msg, "attachments", None) or []:
+            text_attachment = getattr(attachment, "text", None)
+            text_content = (getattr(text_attachment, "content", None) or "").strip()
+            if text_content:
+                parts.append(text_content)
+        return "\n\n".join(parts).strip()
+
+    w = WorkspaceClient()
+    timeout = datetime.timedelta(seconds=timeout_seconds)
+    if conversation_id:
+        msg = w.genie.create_message_and_wait(space_id=space_id, conversation_id=conversation_id, content=prompt, timeout=timeout)
+    else:
+        msg = w.genie.start_conversation_and_wait(space_id=space_id, content=prompt, timeout=timeout)
+
+    conv_id = getattr(msg, "conversation_id", None)
+    response_text = _extract_text(msg)
+
+    # Some Genie SDK calls return the submitted/user message first. Fetch latest conversation messages
+    # and pick the newest non-empty response that differs from the prompt.
+    if conv_id and (not response_text or response_text.strip() == prompt.strip()):
+        try:
+            messages_resp = w.genie.list_conversation_messages(space_id=space_id, conversation_id=conv_id, page_size=20)
+            messages = messages_resp.messages or []
+            messages_sorted = sorted(
+                messages,
+                key=lambda m: getattr(m, "created_timestamp", 0) or 0,
+                reverse=True,
+            )
+            for m in messages_sorted:
+                candidate = _extract_text(m)
+                if candidate and candidate.strip() != prompt.strip():
+                    response_text = candidate
+                    break
+        except Exception:
+            pass
+
+    return response_text.strip(), conv_id
+
+
+def load_data_from_genie(space_id: str) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    data = empty_data()
+    logs: list[str] = []
+    conv_id: str | None = None
+    prompts = [
+        (
+            "stations",
+            "Return all rows from catalog_caiom7nmz_d9oink.renfe_app_data.stations_dim "
+            "with columns station_code, station_name, lat, lon, province, source.",
+            normalize_geo_points,
+        ),
+        (
+            "trip_updates",
+            "Return all rows from catalog_caiom7nmz_d9oink.renfe_app_data.trip_updates_rt "
+            "with columns trip_id, delay_seconds, timestamp, feed.",
+            normalize_trip_updates,
+        ),
+        (
+            "vehicles",
+            "Return all rows from catalog_caiom7nmz_d9oink.renfe_app_data.vehicle_positions_rt "
+            "with columns trip_id, vehicle_id, vehicle_label, status, stop_id, lat, lon.",
+            normalize_vehicles,
+        ),
+        (
+            "gtfs_routes",
+            "Return all rows from catalog_caiom7nmz_d9oink.renfe_app_data.routes_dim with column route_short_name.",
+            normalize_routes,
+        ),
+        (
+            "gtfs_trips",
+            "Return all rows from catalog_caiom7nmz_d9oink.renfe_app_data.trips_dim with column trip_id.",
+            normalize_scheduled_trips,
+        ),
+        (
+            "alerts",
+            "Return all rows from catalog_caiom7nmz_d9oink.renfe_app_data.alerts_rt "
+            "with columns id, route_count, description.",
+            normalize_alerts,
+        ),
+        (
+            "incidents",
+            "Return all rows from catalog_caiom7nmz_d9oink.renfe_app_data.incidents.",
+            lambda df: df,
+        ),
+        (
+            "atendo",
+            "Return all rows from catalog_caiom7nmz_d9oink.renfe_app_data.atendo_accessibility.",
+            lambda df: df,
+        ),
+    ]
+
+    for key, prompt, normalizer in prompts:
+        df, conv_id, message_text = _run_genie_prompt(space_id=space_id, prompt=prompt, conversation_id=conv_id)
+        data[key] = normalizer(df)
+        logs.append(f"{key}: {len(data[key]):,} rows")
+        if message_text:
+            logs.append(f"Genie ({key}): {message_text[:140]}")
+    return data, logs
+
+
+def render_genie_tab(space_id: str, title: str, key_prefix: str) -> None:
+    st.subheader(title)
+    st.caption(f"Genie Space: `{space_id}`")
+
+    conv_key = f"{key_prefix}_conversation_id"
+    history_key = f"{key_prefix}_history"
+    input_key = f"{key_prefix}_input"
+    send_key = f"{key_prefix}_send"
+    clear_key = f"{key_prefix}_clear"
+
+    if conv_key not in st.session_state:
+        st.session_state[conv_key] = None
+    if history_key not in st.session_state:
+        st.session_state[history_key] = []
+
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        prompt = st.text_input(
+            "Ask Genie",
+            placeholder="Example: Show top 10 delayed trips",
+            key=input_key,
+        )
+    with col2:
+        send = st.button("Send", use_container_width=True, key=send_key)
+
+    if send:
+        if not space_id:
+            st.error("Missing Genie space ID.")
+        elif not prompt.strip():
+            st.warning("Enter a question for Genie.")
+        else:
+            try:
+                with st.spinner("Querying Genie..."):
+                    response_text, conv_id = _run_genie_chat_prompt(
+                        space_id=space_id,
+                        prompt=prompt.strip(),
+                        conversation_id=st.session_state[conv_key],
+                    )
+                st.session_state[conv_key] = conv_id
+                st.session_state[history_key].append(
+                    {
+                        "prompt": prompt.strip(),
+                        "response": response_text,
+                    }
+                )
+            except Exception as exc:
+                st.error(str(exc))
+
+    if st.session_state[history_key]:
+        if st.button("Clear conversation", key=clear_key):
+            st.session_state[conv_key] = None
+            st.session_state[history_key] = []
+            st.rerun()
+
+    for i, item in enumerate(reversed(st.session_state[history_key]), start=1):
+        st.markdown(f"**Q{i}:** {item['prompt']}")
+        if item["response"]:
+            st.write(item["response"])
+        else:
+            st.caption("No response returned yet. Try asking again or rephrasing.")
 
 
 def _metric(label: str, value: str, help_text: str | None = None) -> None:
@@ -458,10 +910,10 @@ def render_dashboards(data: dict[str, pd.DataFrame]) -> None:
                 gtfs_routes["route_short_name"]
                 .fillna("Unknown")
                 .value_counts()
-                .reset_index()
-                .rename(columns={"route_short_name": "service", "count": "routes"})
+                .reset_index(name="routes")
                 .head(12)
             )
+            route_mix.columns = ["service", "routes"]
             fig = px.pie(route_mix, values="routes", names="service", title="Service Mix by Route Type")
             st.plotly_chart(fig, use_container_width=True)
         else:
@@ -476,113 +928,572 @@ def render_dashboards(data: dict[str, pd.DataFrame]) -> None:
         st.dataframe(atendo.head(50), use_container_width=True, hide_index=True)
 
 
+def render_insights_plus(data: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Operational Insights")
+    trip_updates = data["trip_updates"]
+    vehicles = data["vehicles"]
+    alerts = data["alerts"]
+    incidents = data["incidents"]
+
+    left, right = st.columns(2)
+    with left:
+        if not vehicles.empty and "status" in vehicles.columns:
+            status_df = (
+                vehicles["status"]
+                .fillna("UNKNOWN")
+                .value_counts()
+                .reset_index(name="vehicles")
+            )
+            status_df.columns = ["status", "vehicles"]
+            fig = px.bar(status_df, x="status", y="vehicles", title="Active Vehicles by Status")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No vehicle status data available.")
+
+    with right:
+        if not alerts.empty and "route_count" in alerts.columns:
+            fig = px.histogram(alerts, x="route_count", nbins=20, title="Alert Impact Distribution (routes affected)")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No alert impact data available.")
+
+    if not trip_updates.empty and "delay_seconds" in trip_updates.columns:
+        feed_col = "feed" if "feed" in trip_updates.columns else None
+        plot_df = trip_updates.assign(delay_min=trip_updates["delay_seconds"].fillna(0) / 60)
+        if feed_col:
+            fig = px.box(plot_df, x=feed_col, y="delay_min", title="Delay Spread by Service Feed")
+        else:
+            fig = px.box(plot_df, y="delay_min", title="Delay Spread")
+        fig.update_layout(yaxis_title="Delay (min)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No delay spread data available.")
+
+    if not incidents.empty:
+        st.subheader("Latest Incident Notes")
+        preview_cols = [c for c in ["chipText", "aspect", "paragraph", "link"] if c in incidents.columns]
+        if preview_cols:
+            st.dataframe(incidents[preview_cols].head(20), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(incidents.head(20), use_container_width=True, hide_index=True)
+
+
+def render_analytics_plus(data: dict[str, pd.DataFrame]) -> None:
+    st.subheader("Analytics")
+    stations = data["stations"]
+    trip_updates = data["trip_updates"]
+    gtfs_routes = data["gtfs_routes"]
+    gtfs_trips = data["gtfs_trips"]
+
+    left, right = st.columns(2)
+    with left:
+        if not stations.empty and {"source", "province"}.issubset(stations.columns):
+            source_province = (
+                stations.groupby(["source", "province"], dropna=False)
+                .size()
+                .reset_index(name="stations")
+                .sort_values("stations", ascending=False)
+                .head(50)
+            )
+            fig = px.treemap(
+                source_province,
+                path=["source", "province"],
+                values="stations",
+                title="Station Coverage by Source and Province",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No station coverage data available.")
+
+    with right:
+        if not trip_updates.empty and "delay_seconds" in trip_updates.columns:
+            delay = trip_updates["delay_seconds"].fillna(0) / 60
+            buckets = pd.cut(
+                delay,
+                bins=[-1, 0, 5, 15, 30, 10_000],
+                labels=["On time", "0-5 min", "5-15 min", "15-30 min", "30+ min"],
+            )
+            severity = buckets.value_counts().reset_index()
+            severity.columns = ["severity", "trips"]
+            fig = px.pie(severity, values="trips", names="severity", title="Delay Severity Mix")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No delay severity data available.")
+
+    st.subheader("Service Capacity Snapshot")
+    c1, c2 = st.columns(2)
+    with c1:
+        if not gtfs_routes.empty and "route_short_name" in gtfs_routes.columns:
+            top_services = (
+                gtfs_routes["route_short_name"]
+                .fillna("Unknown")
+                .value_counts()
+                .head(15)
+                .reset_index(name="routes")
+            )
+            top_services.columns = ["service", "routes"]
+            fig = px.bar(top_services, x="service", y="routes", title="Top Service Labels by Route Count")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No route service data available.")
+    with c2:
+        if not gtfs_trips.empty and "trip_id" in gtfs_trips.columns:
+            st.metric("Total Scheduled Trips", f"{gtfs_trips['trip_id'].nunique():,}")
+        else:
+            st.info("No scheduled trip catalog available.")
+
+
+def _build_ml_dataset(
+    trip_updates: pd.DataFrame,
+    gtfs_trips: pd.DataFrame,
+    gtfs_routes: pd.DataFrame,
+    vehicles: pd.DataFrame,
+) -> pd.DataFrame:
+    if trip_updates.empty or "delay_seconds" not in trip_updates.columns:
+        return pd.DataFrame()
+
+    df = trip_updates.copy()
+    df["delay_seconds"] = pd.to_numeric(df["delay_seconds"], errors="coerce")
+    df = df.dropna(subset=["delay_seconds"])
+    if df.empty:
+        return pd.DataFrame()
+
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], errors="coerce")
+    else:
+        ts = pd.Series(pd.NaT, index=df.index)
+
+    df["hour"] = ts.dt.hour.fillna(0).astype(int)
+    df["day_of_week"] = ts.dt.dayofweek.fillna(0).astype(int)
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
+    df["month"] = ts.dt.month.fillna(1).astype(int)
+    df["time_bucket"] = pd.cut(
+        df["hour"],
+        bins=[-1, 5, 11, 17, 23],
+        labels=["night", "morning", "afternoon", "evening"],
+    ).astype(str)
+    df["feed"] = df.get("feed", pd.Series("Unknown", index=df.index)).fillna("Unknown").astype(str)
+    trip_id = df.get("trip_id", pd.Series("", index=df.index)).fillna("").astype(str)
+    df["trip_id"] = trip_id
+
+    route_lookup = pd.DataFrame(columns=["trip_id", "route_id", "direction_id"])
+    if not gtfs_trips.empty and "trip_id" in gtfs_trips.columns:
+        route_lookup = gtfs_trips[["trip_id"]].copy()
+        route_lookup["trip_id"] = route_lookup["trip_id"].astype(str)
+        if "route_id" in gtfs_trips.columns:
+            route_lookup["route_id"] = gtfs_trips["route_id"].astype(str)
+        else:
+            route_lookup["route_id"] = ""
+        if "direction_id" in gtfs_trips.columns:
+            route_lookup["direction_id"] = pd.to_numeric(gtfs_trips["direction_id"], errors="coerce").fillna(0).astype(int)
+        else:
+            route_lookup["direction_id"] = 0
+    df = df.merge(route_lookup, how="left", on="trip_id")
+
+    if "route_id" not in df.columns:
+        df["route_id"] = ""
+    df["route_id"] = df["route_id"].fillna("").astype(str)
+    if "direction_id" not in df.columns:
+        df["direction_id"] = 0
+    df["direction_id"] = pd.to_numeric(df["direction_id"], errors="coerce").fillna(0).astype(int)
+
+    route_type_lookup = pd.DataFrame(columns=["route_id", "route_type", "route_short_name"])
+    if not gtfs_routes.empty and "route_id" in gtfs_routes.columns:
+        route_type_lookup = gtfs_routes[["route_id"]].copy()
+        route_type_lookup["route_id"] = route_type_lookup["route_id"].astype(str)
+        if "route_type" in gtfs_routes.columns:
+            route_type_lookup["route_type"] = gtfs_routes["route_type"].astype(str)
+        else:
+            route_type_lookup["route_type"] = "Unknown"
+        if "route_short_name" in gtfs_routes.columns:
+            route_type_lookup["route_short_name"] = gtfs_routes["route_short_name"].astype(str)
+        else:
+            route_type_lookup["route_short_name"] = "Unknown"
+    df = df.merge(route_type_lookup, how="left", on="route_id")
+    df["route_type"] = df.get("route_type", pd.Series("Unknown", index=df.index)).fillna("Unknown").astype(str)
+    df["route_short_name"] = df.get("route_short_name", pd.Series("Unknown", index=df.index)).fillna("Unknown").astype(str)
+
+    vehicle_features = pd.DataFrame(columns=["trip_id", "has_vehicle_position", "vehicle_status_mode", "vehicle_records"])
+    if not vehicles.empty and "trip_id" in vehicles.columns:
+        v = vehicles.copy()
+        v["trip_id"] = v["trip_id"].fillna("").astype(str)
+        status_col = "status" if "status" in v.columns else None
+        if status_col:
+            status_mode = (
+                v.groupby("trip_id")[status_col]
+                .agg(lambda s: s.mode().iloc[0] if not s.mode().empty else "UNKNOWN")
+                .rename("vehicle_status_mode")
+            )
+        else:
+            status_mode = pd.Series(dtype=str, name="vehicle_status_mode")
+        counts = v.groupby("trip_id").size().rename("vehicle_records")
+        vehicle_features = pd.concat([status_mode, counts], axis=1).reset_index()
+        vehicle_features["vehicle_status_mode"] = vehicle_features["vehicle_status_mode"].fillna("UNKNOWN").astype(str)
+        vehicle_features["vehicle_records"] = pd.to_numeric(vehicle_features["vehicle_records"], errors="coerce").fillna(0).astype(int)
+        vehicle_features["has_vehicle_position"] = (vehicle_features["vehicle_records"] > 0).astype(int)
+    df = df.merge(vehicle_features, how="left", on="trip_id")
+    df["vehicle_status_mode"] = df.get("vehicle_status_mode", pd.Series("UNKNOWN", index=df.index)).fillna("UNKNOWN").astype(str)
+    df["vehicle_records"] = pd.to_numeric(df.get("vehicle_records", pd.Series(0, index=df.index)), errors="coerce").fillna(0).astype(int)
+    df["has_vehicle_position"] = pd.to_numeric(df.get("has_vehicle_position", pd.Series(0, index=df.index)), errors="coerce").fillna(0).astype(int)
+
+    return df[
+        [
+            "feed",
+            "day_of_week",
+            "hour",
+            "is_weekend",
+            "month",
+            "time_bucket",
+            "route_type",
+            "route_short_name",
+            "direction_id",
+            "has_vehicle_position",
+            "vehicle_status_mode",
+            "vehicle_records",
+            "delay_seconds",
+        ]
+    ]
+
+
+def render_ml_tab(data: dict[str, pd.DataFrame]) -> None:
+    st.subheader("ML Root Causes & Delay Prediction")
+    ml_df = _build_ml_dataset(data["trip_updates"], data["gtfs_trips"], data["gtfs_routes"], data["vehicles"])
+    if ml_df.empty or len(ml_df) < 30:
+        st.info("Not enough trip update rows to train a model (need at least 30 rows with delay_seconds).")
+        return
+
+    features = [
+        "feed",
+        "day_of_week",
+        "hour",
+        "is_weekend",
+        "month",
+        "time_bucket",
+        "route_type",
+        "route_short_name",
+        "direction_id",
+        "has_vehicle_position",
+        "vehicle_status_mode",
+        "vehicle_records",
+    ]
+    X = ml_df[features]
+    y = ml_df["delay_seconds"]
+
+    if y.nunique() <= 1:
+        st.info("Model training skipped because all delay values are identical.")
+        return
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    categorical_features = ["feed", "time_bucket", "route_type", "route_short_name", "vehicle_status_mode"]
+    numeric_features = [
+        "hour",
+        "day_of_week",
+        "is_weekend",
+        "month",
+        "direction_id",
+        "has_vehicle_position",
+        "vehicle_records",
+    ]
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+            ("num", "passthrough", numeric_features),
+        ]
+    )
+    model = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("regressor", RandomForestRegressor(n_estimators=400, max_depth=16, random_state=42, n_jobs=-1)),
+        ]
+    )
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+
+    mae = mean_absolute_error(y_test, preds)
+    rmse = np.sqrt(mean_squared_error(y_test, preds))
+    r2 = r2_score(y_test, preds)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("MAE", f"{mae/60:.2f} min")
+    with c2:
+        st.metric("RMSE", f"{rmse/60:.2f} min")
+    with c3:
+        st.metric("R²", f"{r2:.3f}")
+
+    st.subheader("Root Cause Drivers (Feature Importance)")
+    transformed_feature_names = model.named_steps["preprocessor"].get_feature_names_out()
+    rf_importance = model.named_steps["regressor"].feature_importances_
+    importance_df = (
+        pd.DataFrame({"feature": transformed_feature_names, "importance": rf_importance})
+        .sort_values("importance", ascending=False)
+        .reset_index(drop=True)
+    )
+    top_importance = importance_df.head(20).copy()
+    fig_imp = px.bar(
+        top_importance.sort_values("importance", ascending=True),
+        x="importance",
+        y="feature",
+        orientation="h",
+        title="Top Feature Importances (Random Forest)",
+    )
+    st.plotly_chart(fig_imp, use_container_width=True)
+
+    # Group encoded features (e.g., cat__route_type_3) into root categories for easier interpretation.
+    def _feature_group(name: str) -> str:
+        if name.startswith("cat__"):
+            raw = name.replace("cat__", "")
+            for base in categorical_features:
+                if raw.startswith(f"{base}_"):
+                    return base
+            return raw
+        if name.startswith("num__"):
+            return name.replace("num__", "")
+        return name
+
+    grouped = (
+        importance_df.assign(group=importance_df["feature"].map(_feature_group))
+        .groupby("group", as_index=False)["importance"]
+        .sum()
+        .sort_values("importance", ascending=False)
+    )
+    fig_group = px.bar(
+        grouped.head(12).sort_values("importance", ascending=True),
+        x="importance",
+        y="group",
+        orientation="h",
+        title="Importance by Root Variable",
+    )
+    st.plotly_chart(fig_group, use_container_width=True)
+
+    # Permutation importance (model-agnostic check) for root variables.
+    try:
+        perm = permutation_importance(model, X_test, y_test, n_repeats=5, random_state=42, n_jobs=1)
+        perm_df = pd.DataFrame(
+            {
+                "feature": X_test.columns,
+                "importance": perm.importances_mean,
+            }
+        ).sort_values("importance", ascending=False)
+        st.caption("Permutation importance (higher means stronger contribution to predictive accuracy).")
+        st.dataframe(perm_df, use_container_width=True, hide_index=True)
+    except Exception:
+        st.caption("Permutation importance unavailable for this run.")
+
+    eval_df = pd.DataFrame({"actual_delay_min": y_test / 60, "predicted_delay_min": preds / 60})
+    fig = px.scatter(
+        eval_df,
+        x="actual_delay_min",
+        y="predicted_delay_min",
+        title="Model Evaluation: Actual vs Predicted Delay",
+    )
+    fig.update_layout(xaxis_title="Actual Delay (min)", yaxis_title="Predicted Delay (min)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Predict a New Delay")
+    route_types = sorted(ml_df["route_type"].dropna().astype(str).unique().tolist())
+    route_type_val = st.selectbox("Route type", options=route_types, index=0 if route_types else None)
+    feeds = sorted(ml_df["feed"].dropna().astype(str).unique().tolist())
+    feed_val = st.selectbox("Feed", options=feeds, index=0 if feeds else None)
+    vehicle_statuses = sorted(ml_df["vehicle_status_mode"].dropna().astype(str).unique().tolist())
+    vehicle_status_val = st.selectbox(
+        "Vehicle status (mode for similar trips)",
+        options=vehicle_statuses,
+        index=0 if vehicle_statuses else None,
+    )
+    route_short_names = sorted(ml_df["route_short_name"].dropna().astype(str).unique().tolist())
+    route_short_name_val = st.selectbox(
+        "Route short name",
+        options=route_short_names,
+        index=0 if route_short_names else None,
+    )
+    hour_val = st.slider("Hour of day", min_value=0, max_value=23, value=8)
+    day_val = st.selectbox("Day of week", options=[0, 1, 2, 3, 4, 5, 6], index=0, format_func=lambda x: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][x])
+    weekend_val = 1 if day_val >= 5 else 0
+    month_val = st.slider("Month", min_value=1, max_value=12, value=1)
+    direction_val = st.selectbox("Direction ID", options=[0, 1], index=0)
+    has_vehicle_val = st.selectbox("Has live vehicle position", options=[0, 1], index=1)
+    vehicle_records_val = st.slider("Vehicle records count", min_value=0, max_value=10, value=1)
+    time_bucket_val = "night" if hour_val <= 5 else "morning" if hour_val <= 11 else "afternoon" if hour_val <= 17 else "evening"
+
+    if st.button("Predict Delay"):
+        sample = pd.DataFrame(
+            [
+                {
+                    "feed": feed_val,
+                    "route_type": route_type_val,
+                    "route_short_name": route_short_name_val,
+                    "hour": hour_val,
+                    "day_of_week": day_val,
+                    "is_weekend": weekend_val,
+                    "month": month_val,
+                    "time_bucket": time_bucket_val,
+                    "direction_id": direction_val,
+                    "has_vehicle_position": has_vehicle_val,
+                    "vehicle_status_mode": vehicle_status_val,
+                    "vehicle_records": vehicle_records_val,
+                }
+            ]
+        )
+        pred_seconds = float(model.predict(sample)[0])
+        st.success(f"Predicted delay: {pred_seconds/60:.1f} minutes ({pred_seconds:.0f} seconds)")
+
 def main() -> None:
     st.title("Renfe Train Analytics App")
-    st.caption("Analytics insights, maps, and operational dashboards using files from the local data folder.")
-
-    data_dir = st.sidebar.text_input("Data folder", value="data")
-    if not Path(data_dir).exists():
-        st.error(f"Data folder not found: {data_dir}")
-        st.stop()
-
-    data = load_data(data_dir)
+    st.caption("Analytics insights, maps, and operational dashboards sourced from Databricks SQL Warehouse.")
 
     st.sidebar.divider()
     st.sidebar.subheader("Databricks SQL Warehouse")
-    sql_enabled = st.sidebar.checkbox("Enable SQL Warehouse integration", value=False)
+    genie_space_id = st.sidebar.text_input("Genie space ID", value=_default_genie_space_id())
+    genie_space_id_2 = st.sidebar.text_input("Genie space ID (Tab 2)", value=_default_genie_space_id_2())
     db_host = st.sidebar.text_input(
         "Server hostname",
-        value=os.getenv("DATABRICKS_SERVER_HOSTNAME", ""),
-        disabled=not sql_enabled,
+        value=_default_server_hostname(),
     )
     db_http_path = st.sidebar.text_input(
         "HTTP path",
-        value=os.getenv("DATABRICKS_HTTP_PATH", ""),
-        disabled=not sql_enabled,
+        value=_default_http_path(),
     )
     db_token = st.sidebar.text_input(
-        "Access token",
+        "Access token (optional in Databricks Apps)",
         value=os.getenv("DATABRICKS_TOKEN", ""),
         type="password",
-        disabled=not sql_enabled,
+    )
+    stations_sql = st.sidebar.text_area(
+        "Stations query",
+        value=st.session_state.get("stations_sql", GEO_QUERY_HINT),
+        height=120,
     )
     trip_sql = st.sidebar.text_area(
-        "Trip query (optional)",
+        "Trip updates query",
         value=st.session_state.get("trip_sql", TRIP_QUERY_HINT),
-        height=150,
-        disabled=not sql_enabled,
+        height=120,
     )
-    geo_sql = st.sidebar.text_area(
-        "Geo query (optional)",
-        value=st.session_state.get("geo_sql", GEO_QUERY_HINT),
-        height=140,
-        disabled=not sql_enabled,
+    vehicles_sql = st.sidebar.text_area(
+        "Vehicles query",
+        value=st.session_state.get("vehicles_sql", VEHICLES_QUERY_HINT),
+        height=120,
     )
+    routes_sql = st.sidebar.text_area(
+        "Routes query",
+        value=st.session_state.get("routes_sql", ROUTES_QUERY_HINT),
+        height=90,
+    )
+    scheduled_trips_sql = st.sidebar.text_area(
+        "Scheduled trips query",
+        value=st.session_state.get("scheduled_trips_sql", SCHEDULED_TRIPS_QUERY_HINT),
+        height=90,
+    )
+    alerts_sql = st.sidebar.text_area(
+        "Alerts query",
+        value=st.session_state.get("alerts_sql", ALERTS_QUERY_HINT),
+        height=90,
+    )
+    incidents_sql = st.sidebar.text_area(
+        "Incidents query (optional)",
+        value=st.session_state.get("incidents_sql", INCIDENTS_QUERY_HINT),
+        height=90,
+    )
+    atendo_sql = st.sidebar.text_area(
+        "Atendo query (optional)",
+        value=st.session_state.get("atendo_sql", ATENDO_QUERY_HINT),
+        height=90,
+    )
+    st.session_state["stations_sql"] = stations_sql
     st.session_state["trip_sql"] = trip_sql
-    st.session_state["geo_sql"] = geo_sql
-    refresh_sql = st.sidebar.button("Refresh warehouse data", disabled=not sql_enabled)
+    st.session_state["vehicles_sql"] = vehicles_sql
+    st.session_state["routes_sql"] = routes_sql
+    st.session_state["scheduled_trips_sql"] = scheduled_trips_sql
+    st.session_state["alerts_sql"] = alerts_sql
+    st.session_state["incidents_sql"] = incidents_sql
+    st.session_state["atendo_sql"] = atendo_sql
+    refresh_sql = st.sidebar.button("Refresh warehouse data")
 
-    if "warehouse_trip_updates" not in st.session_state:
-        st.session_state["warehouse_trip_updates"] = pd.DataFrame(
-            columns=["feed", "entity_id", "trip_id", "delay_seconds", "timestamp"]
-        )
-    if "warehouse_geo_points" not in st.session_state:
-        st.session_state["warehouse_geo_points"] = pd.DataFrame(
-            columns=["station_code", "station_name", "lat", "lon", "province", "source"]
-        )
+    if "warehouse_data" not in st.session_state:
+        st.session_state["warehouse_data"] = empty_data()
     if "warehouse_error" not in st.session_state:
         st.session_state["warehouse_error"] = ""
+    if "warehouse_loaded" not in st.session_state:
+        st.session_state["warehouse_loaded"] = False
+    query_map = {
+        "stations": stations_sql,
+        "trip_updates": trip_sql,
+        "vehicles": vehicles_sql,
+        "routes": routes_sql,
+        "scheduled_trips": scheduled_trips_sql,
+        "alerts": alerts_sql,
+        "incidents": incidents_sql,
+        "atendo": atendo_sql,
+    }
 
-    if refresh_sql:
+    must_reload = refresh_sql or not st.session_state["warehouse_loaded"]
+    if must_reload:
         st.session_state["warehouse_error"] = ""
-        trip_df = pd.DataFrame(columns=["feed", "entity_id", "trip_id", "delay_seconds", "timestamp"])
-        geo_df = pd.DataFrame(columns=["station_code", "station_name", "lat", "lon", "province", "source"])
-
-        if not db_host or not db_http_path or not db_token:
-            st.session_state["warehouse_error"] = "Missing Databricks SQL credentials."
+        has_token = bool((db_token or "").strip())
+        if not db_host or not db_http_path:
+            st.session_state["warehouse_error"] = (
+                "Missing Databricks SQL connection settings (server hostname or HTTP path)."
+            )
+            st.session_state["warehouse_data"] = empty_data()
+            st.session_state["warehouse_loaded"] = False
+        elif not has_token and not _has_app_oauth_credentials():
+            st.session_state["warehouse_error"] = (
+                "Missing Databricks SQL credentials. Provide DATABRICKS_TOKEN, or run inside Databricks Apps "
+                "with DATABRICKS_CLIENT_ID/DATABRICKS_CLIENT_SECRET injected."
+            )
+            st.session_state["warehouse_data"] = empty_data()
+            st.session_state["warehouse_loaded"] = False
         else:
             try:
-                clean_trip_query = _clean_query(trip_sql)
-                clean_geo_query = _clean_query(geo_sql)
-                if clean_trip_query:
-                    trip_raw = run_warehouse_query(db_host, db_http_path, db_token, clean_trip_query)
-                    trip_df = normalize_trip_updates(trip_raw)
-                if clean_geo_query:
-                    geo_raw = run_warehouse_query(db_host, db_http_path, db_token, clean_geo_query)
-                    geo_df = normalize_geo_points(geo_raw)
+                st.session_state["warehouse_data"] = load_data_from_warehouse(db_host, db_http_path, db_token, query_map)
+                st.session_state["warehouse_loaded"] = True
             except Exception as exc:
                 st.session_state["warehouse_error"] = str(exc)
+                st.session_state["warehouse_data"] = empty_data()
+                st.session_state["warehouse_loaded"] = False
 
-        st.session_state["warehouse_trip_updates"] = trip_df
-        st.session_state["warehouse_geo_points"] = geo_df
-
-    warehouse_trip_updates = st.session_state["warehouse_trip_updates"]
-    warehouse_geo_points = st.session_state["warehouse_geo_points"]
+    data = st.session_state["warehouse_data"]
     warehouse_error = st.session_state["warehouse_error"]
 
-    if not warehouse_trip_updates.empty:
-        data["trip_updates"] = pd.concat([data["trip_updates"], warehouse_trip_updates], ignore_index=True)
-    if not warehouse_geo_points.empty:
-        data["stations"] = pd.concat([data["stations"], warehouse_geo_points], ignore_index=True)
-
-    tab_insights, tab_map, tab_dash = st.tabs(["Analytics Insights", "Maps", "Dashboards"])
+    tab_insights, tab_map, tab_dash, tab_insights_plus, tab_analytics_plus, tab_ml, tab_genie, tab_genie_2 = st.tabs(
+        ["Analytics Insights", "Maps", "Dashboards", "Insights+", "Analytics+", "ML Delay Prediction", "Genie", "Genie 2"]
+    )
     with tab_insights:
+        if warehouse_error:
+            st.error(warehouse_error)
         render_insights(data)
     with tab_map:
+        if warehouse_error:
+            st.error(warehouse_error)
         render_map(data)
     with tab_dash:
         render_dashboards(data)
-        st.subheader("Warehouse Integration Status")
-        if not sql_enabled:
-            st.info("Warehouse integration is disabled. Enable it in the sidebar.")
-        elif warehouse_error:
+        st.subheader("Warehouse Status")
+        if warehouse_error:
             st.error(warehouse_error)
         else:
             st.success(
-                f"Warehouse rows loaded: trips={len(warehouse_trip_updates):,}, geo points={len(warehouse_geo_points):,}"
+                "Warehouse data loaded successfully."
             )
-        if sql_enabled:
-            st.caption("Use the sidebar to update credentials and refresh SQL-backed datasets.")
+        st.caption(
+            "This app reads dashboard data from Databricks SQL Warehouse queries configured in the sidebar."
+        )
+    with tab_insights_plus:
+        if warehouse_error:
+            st.error(warehouse_error)
+        render_insights_plus(data)
+    with tab_analytics_plus:
+        if warehouse_error:
+            st.error(warehouse_error)
+        render_analytics_plus(data)
+    with tab_ml:
+        if warehouse_error:
+            st.error(warehouse_error)
+        render_ml_tab(data)
+    with tab_genie:
+        render_genie_tab(genie_space_id, "Genie Assistant", "genie1")
+    with tab_genie_2:
+        render_genie_tab(genie_space_id_2, "Genie Assistant 2", "genie2")
 
 
 if __name__ == "__main__":

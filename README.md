@@ -1,6 +1,6 @@
 # renfe-train-analytics
 
-Databricks App for Renfe analytics built from files in `data/`.
+Databricks App for Renfe analytics sourced from Databricks SQL Warehouse.
 
 ## Features
 
@@ -15,7 +15,7 @@ Databricks App for Renfe analytics built from files in `data/`.
   - Route service mix
   - Live service alerts
   - Atendo accessibility coverage preview
-  - Databricks SQL Warehouse integration status
+  - Warehouse load status
 
 ## Files added for the app
 
@@ -30,11 +30,9 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app reads data from `data/` by default (configurable in the sidebar).
+### Databricks SQL Warehouse configuration (required)
 
-### Optional Databricks SQL Warehouse integration
-
-You can enrich local files with live Delta/warehouse data from the sidebar.
+The app reads dashboard/map data from SQL queries configured in the sidebar.
 
 Provide credentials via sidebar or environment variables:
 
@@ -42,21 +40,46 @@ Provide credentials via sidebar or environment variables:
 - `DATABRICKS_HTTP_PATH`
 - `DATABRICKS_TOKEN`
 
-Then enable integration and run:
+In Databricks Apps deployment, `DATABRICKS_TOKEN` can be left empty if app OAuth credentials
+are injected and the SQL Warehouse resource is attached.
 
-- **Trip query** returning columns like:
+### Genie integration
+
+The app supports loading datasets through Genie. Default room:
+`https://adb-7405618360625211.11.azuredatabricks.net/genie/rooms/01f10d0ef5311278a6829ada8a43e5b7?o=7405618360625211`
+
+Second Genie tab room:
+`https://adb-7405618360625211.11.azuredatabricks.net/genie/rooms/01f10d2386d41be4a33a652f9e3cf521?o=7405618360625211`
+
+In the sidebar, enable `Use Genie room for data loading`.
+
+Provide queries for these datasets:
+
+- **Stations query** returning columns like:
+  - `station_code` (optional)
+  - `station_name`
+  - `lat`
+  - `lon`
+  - `province` (optional)
+  - `source` (optional)
+- **Trip updates query** returning columns like:
   - `trip_id`
   - `delay_seconds` (or `delay_min`/`delay_minutes`)
   - `timestamp` (optional)
   - `feed` (optional)
-- **Geo query** returning columns like:
+- **Vehicles query** returning columns like:
+  - `trip_id` (optional)
+  - `vehicle_id` (optional)
+  - `vehicle_label` (optional)
+  - `status` (optional)
+  - `stop_id` (optional)
   - `lat`
   - `lon`
-  - `station_name` (optional)
-  - `province` (optional)
-  - `source` (optional)
-
-Successful results are merged into the existing Insights, Maps, and Dashboards views.
+- **Routes query** with at least one route/service label column.
+- **Scheduled trips query** with one row per scheduled trip.
+- **Alerts query** returning `id`, `description`, and optional `route_count`.
+- **Incidents query** (optional).
+- **Atendo query** (optional).
 
 ## Deploy with Databricks Asset Bundles
 
@@ -94,4 +117,66 @@ databricks bundle run renfe_train_analytics_app -t dev
 
 ```bash
 databricks bundle summary -t dev
+```
+
+## Load Source Files Into Unity Catalog
+
+Scripts are available under `scripts/` to ingest all datasets used by the app into:
+`catalog_caiom7nmz_d9oink.renfe_app_data`
+
+Run on Databricks (cluster or serverless notebook with PySpark):
+
+```bash
+python scripts/load_renfe_files_to_uc.py \
+  --data-dir data \
+  --catalog catalog_caiom7nmz_d9oink \
+  --schema renfe_app_data
+```
+
+If the catalog does not exist and your metastore has no default storage root configured, use:
+
+```bash
+python scripts/load_renfe_files_to_uc.py \
+  --data-dir data \
+  --catalog catalog_caiom7nmz_d9oink \
+  --schema renfe_app_data \
+  --create-catalog \
+  --catalog-managed-location "abfss://<container>@<storage-account>.dfs.core.windows.net/<path>"
+```
+
+Tables created:
+
+- `stations_dim`
+- `trip_updates_rt`
+- `vehicle_positions_rt`
+- `routes_dim`
+- `trips_dim`
+- `alerts_rt`
+- `incidents`
+- `atendo_accessibility`
+
+Use `scripts/app_queries.sql` as copy/paste query templates for the Streamlit app sidebar.
+
+### Run Loader As Bundle Job
+
+The bundle includes job resource key: `load_renfe_to_uc_job`
+
+Deploy resources:
+
+```bash
+databricks bundle deploy -t dev
+```
+
+Run the loader job:
+
+```bash
+databricks bundle run load_renfe_to_uc_job -t dev
+```
+
+If needed, override cluster settings at deploy time:
+
+```bash
+databricks bundle deploy -t dev \
+  --var loader_spark_version=15.4.x-scala2.12 \
+  --var loader_node_type_id=Standard_DS3_v2
 ```

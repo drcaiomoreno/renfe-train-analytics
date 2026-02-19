@@ -7,3 +7,9 @@ command:
 env:
   - name: STREAMLIT_SERVER_HEADLESS
     value: "true"
+  - name: WAREHOUSE_ID
+    valueFrom: sql_warehouse
+  - name: GENIE_SPACE_ID
+    valueFrom: renfe_genie_space
+  - name: GENIE_SPACE_ID_2
+    valueFrom: renfe_genie_space_2
